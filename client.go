@@ -329,6 +329,13 @@ func (c *Client) monitor(ctx context.Context) {
 				continue
 			}
 
+			// StatusBadTooManyOperations is a service-level error and does
+			// not indicate that the connection is broken; skip it and
+			// continue the monitor loop instead of reconnecting.
+			if errors.Is(err, ua.StatusBadTooManyOperations) {
+				continue
+			}
+
 			// tell the handler the connection is disconnected
 			c.setState(ctx, Disconnected)
 			dlog.Print("disconnected")

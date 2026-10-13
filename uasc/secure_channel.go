@@ -174,6 +174,13 @@ type SecureChannel struct {
 	kind channelKind
 
 	closeOnce sync.Once
+
+	// openSecureChannelRequestID holds the request id of the in-flight
+	// OpenSecureChannel request, or 0 when no open is in progress. Some
+	// servers answer a failed OpenSecureChannel request with a ServiceFault
+	// whose request id is 0; the dispatcher uses this field to route such
+	// error responses to the pending open request.
+	openSecureChannelRequestID atomic.Uint32
 }
 
 func NewSecureChannel(endpoint string, c *uacp.Conn, cfg *Config, errCh chan<- error) (*SecureChannel, error) {
@@ -285,6 +292,14 @@ func (s *SecureChannel) dispatcher() {
 				debug.Printf("uasc %d/%d: err: %v", s.c.ID(), msg.RequestID, msg.Err)
 			} else {
 				debug.Printf("uasc %d/%d: recv %T", s.c.ID(), msg.RequestID, msg.body)
+			}
+
+			// hack: a failed OpenSecureChannel request may be answered with
+			// a ServiceFault carrying request id 0; route it to the pending
+			// open request so that the caller fails fast instead of waiting
+			// for the request timeout.
+			if openSecureChannelRequestID := s.openSecureChannelRequestID.Load(); msg.Err != nil && msg.RequestID == 0 && openSecureChannelRequestID != 0 {
+				msg.RequestID = openSecureChannelRequestID
 			}
 
 			ch, ok := s.popHandler(msg.RequestID)
@@ -440,12 +455,19 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 	if err == io.EOF || len(b) == 0 {
 		return nil, io.EOF
 	}
-	// do not wrap this error since it hides conn error
-	var uacperr *uacp.Error
-	if errors.As(err, &uacperr) {
-		return nil, err
-	}
 	if err != nil {
+		// a broken connection (RST, local close, ...) surfaces as a
+		// net.OpError; report it as io.EOF so that the reconnect logic
+		// treats it as a lost connection.
+		var opError *net.OpError
+		if errors.As(err, &opError) {
+			return nil, io.EOF
+		}
+		// do not wrap this error since it hides conn error
+		var uacperr *uacp.Error
+		if errors.As(err, &uacperr) {
+			return nil, err
+		}
 		return nil, errors.Errorf("sechan: read header failed: %s %#v", err, err)
 	}
 
@@ -644,6 +666,13 @@ func (s *SecureChannel) open(ctx context.Context, instance *channelInstance, req
 	}()
 
 	reqID := s.nextRequestID()
+
+	// register the request id of the in-flight open request so that the
+	// dispatcher can route a ServiceFault with request id 0 back to it.
+	s.openSecureChannelRequestID.Store(reqID)
+	defer func() {
+		s.openSecureChannelRequestID.Store(0)
+	}()
 
 	s.openingInstance.algo = algo
 	s.openingInstance.SetMaximumBodySize(int(s.c.SendBufSize()))
