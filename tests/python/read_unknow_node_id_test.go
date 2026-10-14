@@ -38,6 +38,11 @@ func TestReadUnknowNodeID(t *testing.T) {
 	require.NoError(t, err, "Read failed")
 
 	require.Equal(t, ua.StatusBadDataTypeIDUnknown, resp.Results[0].Status, "got different status for a node with an unknown type")
+	extensionObject := resp.Results[0].Value.ExtensionObject()
+	require.NotNil(t, extensionObject)
+	require.Equal(t, ua.NewStringNodeID(2, "IntValType"), extensionObject.TypeID.NodeID)
+	require.Equal(t, ua.ExtensionObjectBinary, int(extensionObject.EncodingMask))
+	require.Equal(t, make([]byte, 8), extensionObject.Value, "unknown extension object should retain its raw Int64 body")
 
 	// check that the connection is still usable by reading another node.
 	_, err = c.Read(ctx, &ua.ReadRequest{

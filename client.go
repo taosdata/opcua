@@ -1101,17 +1101,20 @@ func (c *Client) Read(ctx context.Context, req *ua.ReadRequest) (*ua.ReadRespons
 		}
 
 		// If the client cannot decode an extension object then its
-		// value will be nil. However, since the EO was known to the
+		// value will be nil or contain its raw body. Since the EO is known to the
 		// server the StatusCode for that data value will be OK. We
-		// therefore check for extension objects with nil values and set
+		// therefore check for extension objects with nil or raw values and set
 		// the status code to StatusBadDataTypeIDUnknown.
 		for _, dv := range res.Results {
 			if dv.Value == nil {
 				continue
 			}
 			val := dv.Value.Value()
-			if eo, ok := val.(*ua.ExtensionObject); ok && eo.Value == nil {
-				dv.Status = ua.StatusBadDataTypeIDUnknown
+			if eo, ok := val.(*ua.ExtensionObject); ok {
+				_, raw := eo.Value.([]byte)
+				if eo.Value == nil || raw {
+					dv.Status = ua.StatusBadDataTypeIDUnknown
+				}
 			}
 		}
 		return nil
