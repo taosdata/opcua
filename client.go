@@ -153,11 +153,10 @@ type Client struct {
 	// for all active subscriptions.
 	pendingAcks []*ua.SubscriptionAcknowledgement
 
-	// pausech pauses the subscription publish loop
-	pausech chan struct{}
-
-	// resumech resumes subscription publish loop
-	resumech chan struct{}
+	publishMu         sync.Mutex
+	publishPaused     bool
+	publishGeneration uint64
+	publishWake       chan struct{}
 
 	// mcancel stops subscription publish loop
 	mcancel func()
@@ -197,8 +196,7 @@ func NewClient(endpoint string, opts ...Option) (*Client, error) {
 		sechanErr:   make(chan error, 1),
 		subs:        make(map[uint32]*Subscription),
 		pendingAcks: make([]*ua.SubscriptionAcknowledgement, 0),
-		pausech:     make(chan struct{}, 2),
-		resumech:    make(chan struct{}, 2),
+		publishWake: make(chan struct{}, 1),
 	}
 	c.pauseSubscriptions(context.Background())
 	c.setPublishTimeout(uasc.MaxTimeout)

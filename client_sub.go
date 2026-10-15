@@ -47,9 +47,6 @@ func (c *Client) Subscribe(ctx context.Context, params *SubscriptionParameters, 
 
 	stats.Subscription().Add("Count", 1)
 
-	// start the publish loop if it isn't already running
-	c.resumech <- struct{}{}
-
 	sub := &Subscription{
 		SubscriptionID:            res.SubscriptionID,
 		RevisedPublishingInterval: time.Duration(res.RevisedPublishingInterval) * time.Millisecond,
@@ -73,6 +70,7 @@ func (c *Client) Subscribe(ctx context.Context, params *SubscriptionParameters, 
 
 	c.subs[sub.SubscriptionID] = sub
 	c.updatePublishTimeout_NeedsSubMuxRLock()
+	c.resumeSubscriptions(ctx)
 	return sub, nil
 }
 
@@ -340,21 +338,21 @@ func (c *Client) notifySubscription(ctx context.Context, sub *Subscription, noti
 	}
 }
 
-// pauseSubscriptions suspends the publish loop by signalling the pausech.
-// It has no effect if the publish loop is already paused.
-func (c *Client) pauseSubscriptions(ctx context.Context) {
-	select {
-	case <-ctx.Done():
-	case c.pausech <- struct{}{}:
-	}
+func (c *Client) pauseSubscriptions(_ context.Context) {
+	c.setPublishState(true)
 }
 
-// resumeSubscriptions restarts the publish loop by signalling the resumech.
-// It has no effect if the publish loop is not paused.
-func (c *Client) resumeSubscriptions(ctx context.Context) {
+func (c *Client) resumeSubscriptions(_ context.Context) {
+	c.setPublishState(false)
+}
+
+func (c *Client) setPublishState(paused bool) {
+	c.publishMu.Lock()
+	c.publishPaused = paused
+	c.publishGeneration++
+	c.publishMu.Unlock()
 	select {
-	case <-ctx.Done():
-	case c.resumech <- struct{}{}:
+	case c.publishWake <- struct{}{}:
 	default:
 	}
 }
@@ -365,34 +363,22 @@ func (c *Client) monitorSubscriptions(ctx context.Context) {
 	dlog := debug.NewPrefixLogger("sub: ")
 	defer dlog.Print("done")
 
-publish:
 	for {
+		c.publishMu.Lock()
+		paused, generation := c.publishPaused, c.publishGeneration
+		c.publishMu.Unlock()
+		if paused {
+			select {
+			case <-ctx.Done():
+				return
+			case <-c.publishWake:
+				continue
+			}
+		}
 		select {
 		case <-ctx.Done():
 			dlog.Println("ctx.Done()")
 			return
-
-		case <-c.resumech:
-			dlog.Print("resume")
-			// ignore since not paused
-
-		case <-c.pausech:
-			dlog.Print("pause")
-			for {
-				select {
-				case <-ctx.Done():
-					dlog.Print("pause: ctx.Done()")
-					return
-
-				case <-c.resumech:
-					dlog.Print("pause: resume")
-					continue publish
-
-				case <-c.pausech:
-					dlog.Print("pause: pause")
-					// ignore since already paused
-				}
-			}
 
 		default:
 			// send publish request and handle response
@@ -401,7 +387,12 @@ publish:
 			// is received or the context is cancelled.
 			if err := c.publish(ctx); err != nil {
 				dlog.Print("error: ", err.Error())
-				c.pauseSubscriptions(ctx)
+				c.publishMu.Lock()
+				if c.publishGeneration == generation {
+					c.publishPaused = true
+					c.publishGeneration++
+				}
+				c.publishMu.Unlock()
 			}
 		}
 	}

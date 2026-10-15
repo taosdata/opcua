@@ -5,6 +5,7 @@ import sys
 from asyncua import Server, ua
 from asyncua.server.internal_session import InternalSession
 from asyncua.server.internal_subscription import InternalSubscription
+from asyncua.server.uaprocessor import UaProcessor
 from asyncua.ua.uaerrors import UaStatusCodeError
 
 logging.basicConfig(level=logging.ERROR)
@@ -14,7 +15,30 @@ original_subscription = InternalSession.create_subscription
 original_items = InternalSession.create_monitored_items
 original_activate = InternalSession.activate_session
 original_republish = InternalSubscription.republish
+original_publish_response = UaProcessor.forward_publish_response
 rejected_session = None
+pending_publish = set()
+
+
+async def publish_response(processor, result, request):
+    global fault
+    if fault in ("hold_publish", "hold_publish_error"):
+        fail = fault == "hold_publish_error"
+        fault = ""
+        print("PUBLISH_HELD", flush=True)
+        async def finish_publish():
+            await release.wait()
+            if fail:
+                response = ua.PublishResponse()
+                response.ResponseHeader.ServiceResult = ua.StatusCode(ua.StatusCodes.BadNoSubscription)
+                processor.send_response(request.requesthdr.RequestHandle, request.seqhdr, response)
+            else:
+                await original_publish_response(processor, result, request)
+        task = asyncio.create_task(finish_publish())
+        pending_publish.add(task)
+        task.add_done_callback(pending_publish.discard)
+        return
+    await original_publish_response(processor, result, request)
 
 
 def republish(subscription, sequence):
@@ -83,6 +107,7 @@ InternalSession.create_subscription = create_subscription
 InternalSession.create_monitored_items = create_items
 InternalSession.activate_session = activate_session
 InternalSubscription.republish = republish
+UaProcessor.forward_publish_response = publish_response
 
 
 async def start_server(endpoint, missing=False):
@@ -132,6 +157,10 @@ async def main():
                 elif command == "release":
                     release.set()
                     print("RELEASED", flush=True)
+                elif command in ("hold_publish", "hold_publish_error"):
+                    release.clear()
+                    fault = command
+                    print("ARMED", flush=True)
                 elif command == "stats":
                     print(f"SESSIONS={len(server.iserver._external_sessions)}", flush=True)
                 elif command == "subscriptions":

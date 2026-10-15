@@ -100,8 +100,13 @@ func TestAutoReconnection(t *testing.T) {
 	for _, tt := range tests {
 		ok := t.Run(tt.name, func(t *testing.T) {
 
-			if msg := <-ch; msg.Error != nil {
-				t.Fatalf("No error expected for first value: %s", msg.Error)
+			select {
+			case msg := <-ch:
+				if msg.Error != nil {
+					t.Fatalf("No error expected for first value: %s", msg.Error)
+				}
+			case <-time.After(reconnectionTimeout):
+				t.Fatal("subscription stopped before the next fault")
 			}
 
 			downC := make(chan struct{}, 1)
@@ -148,6 +153,21 @@ func TestAutoReconnection(t *testing.T) {
 			case msg := <-ch:
 				if err := msg.Error; err != nil {
 					t.Fatal(err)
+				}
+			}
+			previous := time.Now()
+			for updates := 0; updates < 2; {
+				select {
+				case <-rTimeout.C:
+					t.Fatal("subscription did not continue with fresh source timestamps after recovery")
+				case msg := <-ch:
+					if msg.Error != nil {
+						t.Fatal(msg.Error)
+					}
+					if msg.SourceTimestamp.After(previous) {
+						previous = msg.SourceTimestamp
+						updates++
+					}
 				}
 			}
 		})

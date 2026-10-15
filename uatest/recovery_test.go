@@ -292,3 +292,33 @@ func TestSubscriptionRecoveryBlockedNotifications(t *testing.T) {
 	}
 	server.command(t, "stats", "SESSIONS=1")
 }
+
+func TestSubscriptionRecoveryInFlightPublish(t *testing.T) {
+	for _, fault := range []string{"hold_publish", "hold_publish_error"} {
+		t.Run(fault, func(t *testing.T) {
+			ctx, client, server := startRecoveryClient(t)
+			notifications := make(chan *opcua.PublishNotificationData, 128)
+			original, err := client.Subscribe(ctx, &opcua.SubscriptionParameters{Interval: 100 * time.Millisecond}, notifications)
+			if err != nil {
+				t.Fatal(err)
+			}
+			recoveryMonitor(t, ctx, original, 1001, 1)
+			recoveryValue(t, ctx, notifications, 1, time.Time{})
+			server.command(t, fault, "ARMED")
+			server.expect(t, "PUBLISH_HELD")
+			if err := original.Cancel(ctx); err != nil {
+				t.Fatal(err)
+			}
+			replacement, err := client.Subscribe(ctx, &opcua.SubscriptionParameters{Interval: 100 * time.Millisecond}, notifications)
+			if err != nil {
+				t.Fatal(err)
+			}
+			recoveryMonitor(t, ctx, replacement, 1001, 2)
+			server.command(t, "release", "RELEASED")
+			recoveryValue(t, ctx, notifications, 2, time.Now())
+			recoveryValue(t, ctx, notifications, 2, time.Now())
+			server.command(t, "stats", "SESSIONS=1")
+			server.command(t, "subscriptions", "SUBSCRIPTIONS=1")
+		})
+	}
+}
