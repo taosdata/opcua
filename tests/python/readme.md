@@ -1,1 +1,0 @@
-This test package is for testing the gopcua client against an external OPC server (python)

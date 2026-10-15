@@ -6,13 +6,12 @@ package uasc
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
 	"encoding/binary"
 	"io"
 	"math"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,40 +28,11 @@ const (
 	MaxTimeout      = math.MaxUint32 * time.Millisecond
 )
 
-type channelKind int
-
-const (
-	client channelKind = iota
-	server
-)
-
-// ResponseHandler handles the response of a service request and
-// is used by the client.
-type ResponseHandler func(ua.Response) error
-
-// MessageBody is the content of a secure channel message sent
-// between a client and a server and represents a service
-// request or response.
-type MessageBody struct {
-	RequestID       uint32
-	SecureChannelID uint32
-	Err             error
-
-	body any
-}
-
-func (b MessageBody) Request() ua.Request {
-	if x, ok := b.body.(ua.Request); ok {
-		return x
-	}
-	return nil
-}
-
-func (b MessageBody) Response() ua.Response {
-	if x, ok := b.body.(ua.Response); ok {
-		return x
-	}
-	return nil
+type response struct {
+	ReqID uint32
+	SCID  uint32
+	V     interface{}
+	Err   error
 }
 
 type conditionLocker struct {
@@ -131,8 +101,8 @@ type SecureChannel struct {
 	rcvLocker  *conditionLocker
 	pendingReq sync.WaitGroup
 
-	// handles maps requestIDs to response channels
-	handlers   map[uint32]chan *MessageBody
+	// handles maps request IDs to response channels
+	handlers   map[uint32]chan *response
 	handlersMu sync.Mutex
 
 	// chunks maintains a temporary list of chunks for a given request ID
@@ -146,62 +116,14 @@ type SecureChannel struct {
 	openingMu       sync.Mutex
 
 	// errorCh receive dispatcher errors
-	errch chan<- error
-
-	// required for the server channel
-
-	// // secureChannelID is a unique identifier for the SecureChannel assigned by the Server.
-	// // If a Server receives a SecureChannelId which it does not recognize it shall return an
-	// // appropriate transport layer error.
-	// //
-	// // When a Server starts the first SecureChannelId used should be a value that is likely to
-	// // be unique after each restart. This ensures that a Server restart does not cause
-	// // previously connected Clients to accidentally ‘reuse’ SecureChannels that did not belong
-	// // to them.
-	// secureChannelID uint32
-
-	// // sequenceNumber is a monotonically increasing sequence number assigned by the sender to each
-	// // MessageChunk sent over the SecureChannel.
-	// sequenceNumber uint32
-
-	// // securityTokenID is a unique identifier for the SecureChannel SecurityToken used to secure the Message.
-	// // This identifier is returned by the Server in an OpenSecureChannel response Message.
-	// // If a Server receives a TokenId which it does not recognize it shall return an appropriate
-	// // transport layer error.
-	// securityTokenID uint32
-
-	// kind indicates whether this is a server or a client channel.
-	kind channelKind
+	errCh chan<- error
 
 	closeOnce sync.Once
 
-	// openSecureChannelRequestID holds the request id of the in-flight
-	// OpenSecureChannel request, or 0 when no open is in progress. Some
-	// servers answer a failed OpenSecureChannel request with a ServiceFault
-	// whose request id is 0; the dispatcher uses this field to route such
-	// error responses to the pending open request.
 	openSecureChannelRequestID atomic.Uint32
 }
 
 func NewSecureChannel(endpoint string, c *uacp.Conn, cfg *Config, errCh chan<- error) (*SecureChannel, error) {
-	return newSecureChannel(endpoint, c, cfg, client, errCh, 0, 0, 0)
-}
-
-func NewServerSecureChannel(endpoint string, c *uacp.Conn, cfg *Config, errCh chan<- error, secureChannelID, sequenceNumber, securityTokenID uint32) (*SecureChannel, error) {
-	s, err := newSecureChannel(endpoint, c, cfg, server, errCh, secureChannelID, sequenceNumber, securityTokenID)
-	if err != nil {
-		return nil, err
-	}
-
-	s.openingInstance = newChannelInstance(s)
-	s.openingInstance.secureChannelID = secureChannelID
-	s.openingInstance.sequenceNumber = sequenceNumber
-	s.openingInstance.securityTokenID = securityTokenID
-
-	return s, nil
-}
-
-func newSecureChannel(endpoint string, c *uacp.Conn, cfg *Config, kind channelKind, errCh chan<- error, secureChannelID, sequenceNumber, securityTokenID uint32) (*SecureChannel, error) {
 	if c == nil {
 		return nil, errors.Errorf("no connection")
 	}
@@ -217,36 +139,28 @@ func newSecureChannel(endpoint string, c *uacp.Conn, cfg *Config, kind channelKi
 	switch {
 	case cfg.SecurityPolicyURI == ua.SecurityPolicyURINone && cfg.SecurityMode != ua.MessageSecurityModeNone:
 		return nil, errors.Errorf("invalid channel config: Security policy '%s' cannot be used with '%s'", cfg.SecurityPolicyURI, cfg.SecurityMode)
-	case cfg.SecurityPolicyURI != ua.SecurityPolicyURINone && (cfg.SecurityMode != ua.MessageSecurityModeSignAndEncrypt && cfg.SecurityMode != ua.MessageSecurityModeSign):
-		return nil, errors.Errorf("invalid channel config: Security policy '%s' can only be used with '%s' or '%s'", cfg.SecurityPolicyURI, ua.MessageSecurityModeSign, ua.MessageSecurityModeSignAndEncrypt)
+	case cfg.SecurityPolicyURI != ua.SecurityPolicyURINone && cfg.SecurityMode == ua.MessageSecurityModeNone:
+		return nil, errors.Errorf("invalid channel config: Security policy '%s' cannot be used with '%s'", cfg.SecurityPolicyURI, cfg.SecurityMode)
 	case cfg.SecurityPolicyURI != ua.SecurityPolicyURINone && cfg.LocalKey == nil:
 		return nil, errors.Errorf("invalid channel config: Security policy '%s' requires a private key", cfg.SecurityPolicyURI)
 	}
 
 	s := &SecureChannel{
-		endpointURL: endpoint,
-		c:           c,
-		cfg:         cfg,
-		requestID:   cfg.RequestIDSeed,
-		kind:        kind,
-		// secureChannelID: secureChannelID,
-		// sequenceNumber:  sequenceNumber,
-		// securityTokenID: securityTokenID,
+		endpointURL:  endpoint,
+		c:            c,
+		cfg:          cfg,
+		requestID:    cfg.RequestIDSeed,
 		reqLocker:    newConditionLocker(),
 		rcvLocker:    newConditionLocker(),
-		errch:        errCh,
+		errCh:        errCh,
 		closing:      make(chan struct{}),
 		disconnected: make(chan struct{}),
 		instances:    make(map[uint32][]*channelInstance),
 		chunks:       make(map[uint32][]*MessageChunk),
-		handlers:     make(map[uint32]chan *MessageBody),
+		handlers:     make(map[uint32]chan *response),
 	}
 
 	return s, nil
-}
-
-func (s *SecureChannel) RemoteAddr() net.Addr {
-	return s.c.TCPConn.RemoteAddr()
 }
 
 func (s *SecureChannel) getActiveChannelInstance() (*channelInstance, error) {
@@ -271,55 +185,54 @@ func (s *SecureChannel) dispatcher() {
 		case <-s.closing:
 			return
 		default:
-			msg := s.Receive(ctx)
-			if msg.Err != nil {
+			resp := s.receive(ctx)
+
+			if resp.Err != nil {
 				select {
 				case <-s.closing:
 					return
 				default:
 					select {
-					case s.errch <- msg.Err:
+					case s.errCh <- resp.Err:
 					default:
 					}
 				}
 			}
 
-			if msg.Err == io.EOF {
+			if resp.Err == io.EOF {
 				return
 			}
 
-			if msg.Err != nil {
-				debug.Printf("uasc %d/%d: err: %v", s.c.ID(), msg.RequestID, msg.Err)
+			if resp.Err != nil {
+				debug.Printf("uasc %d/%d: err: %v", s.c.ID(), resp.ReqID, resp.Err)
 			} else {
-				debug.Printf("uasc %d/%d: recv %T", s.c.ID(), msg.RequestID, msg.body)
+				debug.Printf("uasc %d/%d: recv %T", s.c.ID(), resp.ReqID, resp.V)
 			}
 
-			// hack: a failed OpenSecureChannel request may be answered with
-			// a ServiceFault carrying request id 0; route it to the pending
-			// open request so that the caller fails fast instead of waiting
-			// for the request timeout.
-			if openSecureChannelRequestID := s.openSecureChannelRequestID.Load(); msg.Err != nil && msg.RequestID == 0 && openSecureChannelRequestID != 0 {
-				msg.RequestID = openSecureChannelRequestID
+			// hack check connect error
+			openSecureChannelRequestID := s.openSecureChannelRequestID.Load()
+			if resp.Err != nil && resp.ReqID == 0 && openSecureChannelRequestID != 0 {
+				resp.ReqID = openSecureChannelRequestID
 			}
 
-			ch, ok := s.popHandler(msg.RequestID)
+			ch, ok := s.popHandler(resp.ReqID)
 
 			if !ok {
-				debug.Printf("uasc %d/%d: no handler for %T", s.c.ID(), msg.RequestID, msg.body)
+				debug.Printf("uasc %d/%d: no handler for %T", s.c.ID(), resp.ReqID, resp.V)
 				continue
 			}
 
 			// HACK
-			if _, ok := msg.Response().(*ua.OpenSecureChannelResponse); ok {
+			if _, ok := resp.V.(*ua.OpenSecureChannelResponse); ok {
 				s.rcvLocker.lock()
 			}
 
-			debug.Printf("uasc %d/%d: sending %T to handler", s.c.ID(), msg.RequestID, msg.body)
+			debug.Printf("uasc %d/%d: sending %T to handler", s.c.ID(), resp.ReqID, resp.V)
 			select {
-			case ch <- msg:
+			case ch <- resp:
 			default:
 				// this should never happen since the chan is of size one
-				debug.Printf("uasc %d/%d: unexpected state. channel write should always succeed.", s.c.ID(), msg.RequestID)
+				debug.Printf("uasc %d/%d: unexpected state. channel write should always succeed.", s.c.ID(), resp.ReqID)
 			}
 
 			s.rcvLocker.waitIfLock()
@@ -327,37 +240,32 @@ func (s *SecureChannel) dispatcher() {
 	}
 }
 
-// Receive receives message chunks from the secure channel, decodes and forwards
+// receive receives message chunks from the secure channel, decodes and forwards
 // them to the registered callback channel, if there is one. Otherwise,
 // the message is dropped.
-func (s *SecureChannel) Receive(ctx context.Context) *MessageBody {
+func (s *SecureChannel) receive(ctx context.Context) *response {
 	for {
 		select {
 		case <-ctx.Done():
-			return &MessageBody{Err: ctx.Err()}
+			return &response{Err: ctx.Err()}
 
 		default:
 			chunk, err := s.readChunk()
 			if err == io.EOF {
 				debug.Printf("uasc %d: readChunk EOF", s.c.ID())
-				return &MessageBody{Err: err}
+				return &response{Err: err}
 			}
 
 			if err != nil {
-				return &MessageBody{Err: err}
+				return &response{Err: err}
 			}
 
 			hdr := chunk.Header
 			reqID := chunk.SequenceHeader.RequestID
 
-			strdat := string(chunk.Data)
-			if strings.Contains(strdat, "CurrentTime") {
-				debug.Printf("Requested CurrentTime.")
-			}
-
-			msg := &MessageBody{
-				RequestID:       reqID,
-				SecureChannelID: chunk.MessageHeader.Header.SecureChannelID,
+			resp := &response{
+				ReqID: reqID,
+				SCID:  chunk.MessageHeader.Header.SecureChannelID,
 			}
 
 			debug.Printf("uasc %d/%d: recv %s%c with %d bytes", s.c.ID(), reqID, hdr.MessageType, hdr.ChunkType, hdr.MessageSize)
@@ -372,19 +280,19 @@ func (s *SecureChannel) Receive(ctx context.Context) *MessageBody {
 				msga := new(MessageAbort)
 				if _, err := msga.Decode(chunk.Data); err != nil {
 					debug.Printf("uasc %d/%d: invalid MSGA chunk. %s", s.c.ID(), reqID, err)
-					msg.Err = ua.StatusBadDecodingError
-					return msg
+					resp.Err = ua.StatusBadDecodingError
+					return resp
 				}
 
-				return &MessageBody{RequestID: reqID, Err: ua.StatusCode(msga.ErrorCode)}
+				return &response{ReqID: reqID, Err: ua.StatusCode(msga.ErrorCode)}
 
 			case 'C':
 				s.chunks[reqID] = append(s.chunks[reqID], chunk)
 				if n := len(s.chunks[reqID]); uint32(n) > s.c.MaxChunkCount() {
 					delete(s.chunks, reqID)
 					s.chunksMu.Unlock()
-					msg.Err = errors.Errorf("too many chunks: %d > %d", n, s.c.MaxChunkCount())
-					return msg
+					resp.Err = errors.Errorf("too many chunks: %d > %d", n, s.c.MaxChunkCount())
+					return resp
 				}
 				s.chunksMu.Unlock()
 				continue
@@ -398,17 +306,14 @@ func (s *SecureChannel) Receive(ctx context.Context) *MessageBody {
 
 			b, err := mergeChunks(all)
 			if err != nil {
-				msg.Err = err
-				return msg
+				resp.Err = err
+				return resp
 			}
 
 			if uint32(len(b)) > s.c.MaxMessageSize() {
-				msg.Err = errors.Errorf("message too large: %d > %d", uint32(len(b)), s.c.MaxMessageSize())
-				return msg
+				resp.Err = errors.Errorf("message too large: %d > %d", uint32(len(b)), s.c.MaxMessageSize())
+				return resp
 			}
-
-			// todo(fs): Why are we talking about ResponseHeaders here?
-			// todo(fs): this should apply to both requests and responses
 
 			// since we are not decoding the ResponseHeader separately
 			// we need to drop every message that has an error since we
@@ -417,34 +322,24 @@ func (s *SecureChannel) Receive(ctx context.Context) *MessageBody {
 			// and subsequently remove it and the TypeID from all service
 			// structs and tests. We also need to add a deadline to all
 			// handlers and check them periodically to time them out.
-			_, body, err := ua.DecodeService(b)
+			_, svc, err := ua.DecodeService(b)
 			if err != nil {
-				msg.Err = err
-				return msg
+				resp.Err = err
+				return resp
 			}
 
-			msg.body = body
-
-			// todo(fs): not sure this is correct
-			if req, ok := msg.Request().(*ua.OpenSecureChannelRequest); ok {
-				err := s.handleOpenSecureChannelRequest(reqID, req)
-				if err != nil {
-					debug.Printf("uasc %d/%d: handling %T failed: %v", s.c.ID(), reqID, req, err)
-					return &MessageBody{Err: err}
-				}
-				return &MessageBody{}
-			}
+			resp.V = svc
 
 			// If the service status is not OK then bubble
 			// that error up to the caller.
-			if resp := msg.Response(); resp != nil {
-				if status := resp.Header().ServiceResult; status != ua.StatusOK {
-					msg.Err = status
-					return msg
+			if r, ok := svc.(ua.Response); ok {
+				if status := r.Header().ServiceResult; status != ua.StatusOK {
+					resp.Err = status
+					return resp
 				}
 			}
 
-			return msg
+			return resp
 		}
 	}
 }
@@ -452,23 +347,20 @@ func (s *SecureChannel) Receive(ctx context.Context) *MessageBody {
 func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 	// read a full message from the underlying conn.
 	b, err := s.c.Receive()
-	if err == io.EOF || len(b) == 0 {
-		return nil, io.EOF
-	}
+	// do not wrap this error since it hides conn error
 	if err != nil {
-		// a broken connection (RST, local close, ...) surfaces as a
-		// net.OpError; report it as io.EOF so that the reconnect logic
-		// treats it as a lost connection.
 		var opError *net.OpError
 		if errors.As(err, &opError) {
 			return nil, io.EOF
 		}
-		// do not wrap this error since it hides conn error
 		var uacperr *uacp.Error
 		if errors.As(err, &uacperr) {
 			return nil, err
 		}
 		return nil, errors.Errorf("sechan: read header failed: %s %#v", err, err)
+	}
+	if len(b) == 0 {
+		return nil, io.EOF
 	}
 
 	const hdrlen = 12 // TODO: move to pkg level const
@@ -496,33 +388,12 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 			return nil, errors.Errorf("sechan: invalid state. openingInstance is nil.")
 		}
 
-		s.cfg.SecurityPolicyURI = m.SecurityPolicyURI
 		if m.SecurityPolicyURI != ua.SecurityPolicyURINone {
 			s.cfg.RemoteCertificate = m.AsymmetricSecurityHeader.SenderCertificate
-			// Re-derive the receiver thumbprint from the peer certificate
-			// learned in the inbound OPN. No-op for the client path, where
-			// Thumbprint is already set from the endpoint's ServerCertificate
-			// at session open.
-			if len(s.cfg.RemoteCertificate) > 0 {
-				s.cfg.Thumbprint = uapolicy.Thumbprint(s.cfg.RemoteCertificate)
-			}
 			debug.Printf("uasc %d: setting securityPolicy to %s", s.c.ID(), m.SecurityPolicyURI)
-
-			remoteCert, err := uapolicy.ParseCertificate(s.cfg.RemoteCertificate)
-			if err != nil {
-				return nil, err
-			}
-			remoteKey, ok := remoteCert.PublicKey.(*rsa.PublicKey)
-			if !ok {
-				return nil, ua.StatusBadCertificateInvalid
-			}
-			algo, err := uapolicy.Asymmetric(s.cfg.SecurityPolicyURI, s.openingInstance.sc.cfg.LocalKey, remoteKey)
-			if err != nil {
-				return nil, err
-			}
-
-			s.openingInstance.algo = algo
 		}
+
+		s.cfg.SecurityPolicyURI = m.SecurityPolicyURI
 
 		decryptWith = s.openingInstance
 	case "CLO":
@@ -580,7 +451,7 @@ func (s *SecureChannel) getInstancesBySecureChannelID(id uint32) []*channelInsta
 	defer s.instancesMu.Unlock()
 
 	instances := s.instances[id]
-	if len(instances) == 0 {
+	if instances == nil {
 		return nil
 	}
 
@@ -600,7 +471,6 @@ func (s *SecureChannel) Open(ctx context.Context) error {
 }
 
 func (s *SecureChannel) open(ctx context.Context, instance *channelInstance, requestType ua.SecurityTokenRequestType) error {
-	debug.Printf("sc.open")
 	defer s.rcvLocker.unlock()
 
 	s.openingMu.Lock()
@@ -629,7 +499,7 @@ func (s *SecureChannel) open(ctx context.Context, instance *channelInstance, req
 		localKey = s.cfg.LocalKey
 		// todo(dh): move this into the uapolicy package proper or
 		// adjust the Asymmetric method to receive a certificate instead
-		remoteCert, err := uapolicy.ParseCertificate(s.cfg.RemoteCertificate)
+		remoteCert, err := x509.ParseCertificate(s.cfg.RemoteCertificate)
 		if err != nil {
 			return err
 		}
@@ -645,9 +515,6 @@ func (s *SecureChannel) open(ctx context.Context, instance *channelInstance, req
 	}
 
 	s.openingInstance = newChannelInstance(s)
-	// s.openingInstance.secureChannelID = s.secureChannelID
-	// s.openingInstance.sequenceNumber = s.sequenceNumber
-	// s.openingInstance.securityTokenID = s.securityTokenID
 
 	if requestType == ua.SecurityTokenRequestTypeRenew {
 		// TODO: lock? sequenceNumber++?
@@ -667,13 +534,6 @@ func (s *SecureChannel) open(ctx context.Context, instance *channelInstance, req
 
 	reqID := s.nextRequestID()
 
-	// register the request id of the in-flight open request so that the
-	// dispatcher can route a ServiceFault with request id 0 back to it.
-	s.openSecureChannelRequestID.Store(reqID)
-	defer func() {
-		s.openSecureChannelRequestID.Store(0)
-	}()
-
 	s.openingInstance.algo = algo
 	s.openingInstance.SetMaximumBodySize(int(s.c.SendBufSize()))
 
@@ -690,8 +550,11 @@ func (s *SecureChannel) open(ctx context.Context, instance *channelInstance, req
 		RequestedLifetime:     s.cfg.Lifetime,
 	}
 
-	return s.sendRequestWithTimeout(ctx, req, reqID, s.openingInstance, nil, s.cfg.RequestTimeout, func(v ua.Response) error {
-		debug.Printf("OpenSecureChannelResponse handler")
+	s.openSecureChannelRequestID.Store(reqID)
+	defer func() {
+		s.openSecureChannelRequestID.Store(0)
+	}()
+	return s.sendRequestWithTimeout(ctx, req, reqID, s.openingInstance, nil, s.cfg.RequestTimeout, func(v interface{}) error {
 		resp, ok := v.(*ua.OpenSecureChannelResponse)
 		if !ok {
 			return errors.Errorf("got %T, want OpenSecureChannelResponse", v)
@@ -701,7 +564,6 @@ func (s *SecureChannel) open(ctx context.Context, instance *channelInstance, req
 }
 
 func (s *SecureChannel) handleOpenSecureChannelResponse(resp *ua.OpenSecureChannelResponse, localNonce []byte, instance *channelInstance) (err error) {
-	debug.Printf("sc.handleOpenSecureChannelResponse")
 	instance.state = channelActive
 	instance.secureChannelID = resp.SecurityToken.ChannelID
 	instance.securityTokenID = resp.SecurityToken.TokenID
@@ -731,134 +593,10 @@ func (s *SecureChannel) handleOpenSecureChannelResponse(resp *ua.OpenSecureChann
 
 	debug.Printf("uasc %d: received security token. channelID=%d tokenID=%d createdAt=%s lifetime=%s", s.c.ID(), instance.secureChannelID, instance.securityTokenID, instance.createdAt.Format(time.RFC3339), instance.revisedLifetime)
 
-	// depending on whether the channel is used in a client
-	// or a server we need to trigger different behavior.
-	// client channels trigger token renewals and need to cleanup old
-	// channel crypto configs. server channels only need to do the
-	// channel cleanup.
-	switch s.kind {
-	case client:
-		go s.scheduleRenewal(instance)
-		go s.scheduleExpiration(instance)
-
-	case server:
-		go s.scheduleExpiration(instance)
-	}
+	go s.scheduleRenewal(instance)
+	go s.scheduleExpiration(instance)
 
 	return
-}
-
-func (s *SecureChannel) handleOpenSecureChannelRequest(reqID uint32, svc ua.Request) error {
-	debug.Printf("handleOpenSecureChannelRequest: Got OPN Request\n")
-
-	var err error
-
-	req, ok := svc.(*ua.OpenSecureChannelRequest)
-	if !ok {
-		debug.Printf("Expected OpenSecureChannel Request, got %T\n", svc)
-	}
-
-	// Part 6.7.4: https://reference.opcfoundation.org/Core/Part6/v105/docs/6.7.4
-	// todo(fs): check that ClientProtocolVersion matches HELLO.Version
-	// todo(fs): respond with Bad_ProtocolVersionUnsupported if they don't match
-	// todo(fs): also make sure that ServerProtocolVersion in the response is the
-	// todo(fs): the same as ACK.Version. Return the error if we don't support
-	// todo(fs): the client protocol version.
-	// todo(fs): how do we get the HELLO.Version here?
-	// if hello.Version != req.ClientProtocolVersion || req.ClientProtocolVersion != 0 {
-	if req.ClientProtocolVersion != 0 {
-		return ua.StatusBadProtocolVersionUnsupported
-	}
-
-	// Part 6.7.4: The AuthenticationToken should be nil. ???
-	if req.RequestHeader.AuthenticationToken.IntID() != 0 {
-		return ua.StatusBadSecureChannelTokenUnknown
-	}
-
-	s.cfg.Lifetime = req.RequestedLifetime
-	s.cfg.SecurityMode = req.SecurityMode
-
-	// I had to do the encryption setup in the chunk decoding logic because you have to
-	// decrypt the thing before you even know you have an open message.
-	// so this is redundant.
-	var (
-		localKey  *rsa.PrivateKey
-		remoteKey *rsa.PublicKey
-	)
-
-	// Set the encryption methods to Asymmetric with the appropriate
-	// public keys.  OpenSecureChannel is always encrypted with the
-	// asymmetric algorithms.
-	// The default value of the encryption algorithm method is the
-	// SecurityModeNone so no additional work is required for that case
-	if s.cfg.SecurityMode != ua.MessageSecurityModeNone {
-		localKey = s.cfg.LocalKey
-		// todo(dh): move this into the uapolicy package proper or
-		// adjust the Asymmetric method to receive a certificate instead
-		remoteCert, err := uapolicy.ParseCertificate(s.cfg.RemoteCertificate)
-		if err != nil {
-			return err
-		}
-		var ok bool
-		if remoteKey, ok = remoteCert.PublicKey.(*rsa.PublicKey); !ok {
-			return ua.StatusBadCertificateInvalid
-		}
-	}
-
-	algo, err := uapolicy.Asymmetric(s.cfg.SecurityPolicyURI, localKey, remoteKey)
-	if err != nil {
-		return err
-	}
-
-	instance := s.openingInstance
-	instance.algo = algo
-	instance.sc.requestID = req.RequestHeader.RequestHandle // todo(fs): is this correct?
-
-	nonce := make([]byte, instance.algo.NonceLength())
-	if _, err := rand.Read(nonce); err != nil {
-		return err
-	}
-	resp := &ua.OpenSecureChannelResponse{
-		ResponseHeader: &ua.ResponseHeader{
-			Timestamp:          s.timeNow(),
-			RequestHandle:      req.RequestHeader.RequestHandle,
-			ServiceDiagnostics: &ua.DiagnosticInfo{},
-			StringTable:        []string{},
-			AdditionalHeader:   ua.NewExtensionObject(nil),
-		},
-		ServerProtocolVersion: 0,
-		SecurityToken: &ua.ChannelSecurityToken{
-			ChannelID:       instance.secureChannelID,
-			TokenID:         instance.securityTokenID,
-			CreatedAt:       s.timeNow(),
-			RevisedLifetime: req.RequestedLifetime,
-		},
-		ServerNonce: nonce,
-	}
-
-	ctx := context.Background() // todo(fs): fixme
-	if err := s.sendResponseWithContext(ctx, instance, reqID, resp); err != nil {
-		return err
-	}
-
-	instance.algo, err = uapolicy.Symmetric(s.cfg.SecurityPolicyURI, nonce, req.ClientNonce)
-	if err != nil {
-		return err
-	}
-	instance.SetMaximumBodySize(int(s.c.SendBufSize()))
-
-	instance.state = channelActive // todo(fs): is this correct?
-	// s.setState(secureChannelOpen)
-
-	s.instancesMu.Lock()
-	s.instances[instance.secureChannelID] = append(
-		s.instances[instance.secureChannelID],
-		instance,
-	)
-	s.activeInstance = instance
-	s.instancesMu.Unlock()
-
-	return nil
 }
 
 func (s *SecureChannel) scheduleRenewal(instance *channelInstance) {
@@ -940,7 +678,7 @@ func (s *SecureChannel) sendRequestWithTimeout(
 	instance *channelInstance,
 	authToken *ua.NodeID,
 	timeout time.Duration,
-	h ResponseHandler) error {
+	h func(interface{}) error) error {
 
 	s.pendingReq.Add(1)
 	respRequired := h != nil
@@ -966,21 +704,21 @@ func (s *SecureChannel) sendRequestWithTimeout(
 	case <-s.disconnected:
 		s.popHandler(reqID)
 		return io.EOF
-	case msg := <-ch:
-		if msg.Err != nil {
-			if msg.Response() != nil {
-				_ = h(msg.Response()) // ignore result because msg.Err takes precedence
+	case resp := <-ch:
+		if resp.Err != nil {
+			if resp.V != nil {
+				_ = h(resp.V) // ignore result because resp.Err takes precedence
 			}
-			return msg.Err
+			return resp.Err
 		}
-		return h(msg.Response())
+		return h(resp.V)
 	case <-timer.C:
 		s.popHandler(reqID)
 		return ua.StatusBadTimeout
 	}
 }
 
-func (s *SecureChannel) popHandler(reqID uint32) (chan *MessageBody, bool) {
+func (s *SecureChannel) popHandler(reqID uint32) (chan *response, bool) {
 	s.handlersMu.Lock()
 	defer s.handlersMu.Unlock()
 
@@ -1000,12 +738,12 @@ func (s *SecureChannel) Renew(ctx context.Context) error {
 	return s.renew(instance)
 }
 
-func (s *SecureChannel) SendRequest(ctx context.Context, req ua.Request, authToken *ua.NodeID, h ResponseHandler) error {
-	// SendRequest sends the service request and calls h with the response.
+// SendRequest sends the service request and calls h with the response.
+func (s *SecureChannel) SendRequest(ctx context.Context, req ua.Request, authToken *ua.NodeID, h func(interface{}) error) error {
 	return s.SendRequestWithTimeout(ctx, req, authToken, s.cfg.RequestTimeout, h)
 }
 
-func (s *SecureChannel) SendRequestWithTimeout(ctx context.Context, req ua.Request, authToken *ua.NodeID, timeout time.Duration, h ResponseHandler) error {
+func (s *SecureChannel) SendRequestWithTimeout(ctx context.Context, req ua.Request, authToken *ua.NodeID, timeout time.Duration, h func(interface{}) error) error {
 	s.reqLocker.waitIfLock()
 	active, err := s.getActiveChannelInstance()
 	if err != nil {
@@ -1023,7 +761,7 @@ func (s *SecureChannel) sendAsyncWithTimeout(
 	authToken *ua.NodeID,
 	respRequired bool,
 	timeout time.Duration,
-) (<-chan *MessageBody, error) {
+) (<-chan *response, error) {
 
 	instance.Lock()
 	defer instance.Unlock()
@@ -1033,11 +771,11 @@ func (s *SecureChannel) sendAsyncWithTimeout(
 		return nil, err
 	}
 
-	var resp chan *MessageBody
+	var resp chan *response
 
 	if respRequired {
 		// register the handler if a callback was passed
-		resp = make(chan *MessageBody, 1)
+		resp = make(chan *response, 1)
 
 		s.handlersMu.Lock()
 
@@ -1073,11 +811,9 @@ func (s *SecureChannel) sendAsyncWithTimeout(
 
 		// send the message
 		var n int
-		s.c.SetWriteDeadline(time.Now().Add(timeout))
 		if n, err = s.c.Write(chunk); err != nil {
 			return nil, err
 		}
-		s.c.SetWriteDeadline(time.Time{})
 
 		atomic.AddUint64(&instance.bytesSent, uint64(n))
 		atomic.AddUint32(&instance.messagesSent, 1)
@@ -1086,119 +822,6 @@ func (s *SecureChannel) sendAsyncWithTimeout(
 	}
 
 	return resp, nil
-}
-
-func (s *SecureChannel) writeMessageChunks(ctx context.Context, instance *channelInstance, reqID uint32, m *Message, body any) (int, error) {
-	// Large service payloads may exceed a single UASC message body. Encode the
-	// full logical message up front, then stream each chunk in sequence while the
-	// caller holds the channel-instance lock.
-	//
-	// TODO: enforce the negotiated MaxMessageSize / MaxChunkCount here and abort
-	// with Bad_ResponseTooLarge instead of writing an over-limit chunk stream.
-	// These limits are already enforced on the receive path (see the chunk-count
-	// and message-size checks in Receive) but not on send (OPC UA Part 6 §6.7.2;
-	// cf. open62541 adjustCheckMessageLimitsSym, .NET MessageLimitsExceeded).
-	chunks, err := m.EncodeChunks(instance.maxBodySize)
-	if err != nil {
-		return 0, err
-	}
-
-	var bytesSent int
-	for i, chunk := range chunks {
-		select {
-		case <-ctx.Done():
-			return bytesSent, ctx.Err()
-		default:
-		}
-
-		if i > 0 {
-			// newMessage assigned the first sequence number when the message header
-			// was created, and EncodeChunks copies it into every chunk. Each chunk
-			// after the first must advance it before signing so the on-wire sequence
-			// remains monotonic.
-			number := instance.nextSequenceNumber()
-			binary.LittleEndian.PutUint32(chunk[16:], uint32(number))
-		}
-
-		// Sign and encrypt after the final chunk bytes are in place, since the
-		// security footer covers the whole encoded chunk.
-		chunk, err = instance.signAndEncrypt(m, chunk)
-		if err != nil {
-			return bytesSent, err
-		}
-
-		// UASC writes are expected to flush complete chunks. Treat short writes as
-		// a hard error instead of silently truncating the response stream.
-		n, err := s.c.Write(chunk)
-		if err != nil {
-			return bytesSent, err
-		}
-		if len(chunk) != n {
-			return bytesSent, errors.Errorf("uasc: incomplete message %T sent len=%d sent=%d", body, len(chunk), n)
-		}
-
-		bytesSent += n
-		atomic.AddUint64(&instance.bytesSent, uint64(n))
-		atomic.AddUint32(&instance.messagesSent, 1)
-	}
-
-	debug.Printf("uasc %d/%d: send %T with %d bytes in %d chunks", s.c.ID(), reqID, body, bytesSent, len(chunks))
-
-	return bytesSent, nil
-}
-
-func (s *SecureChannel) SendResponseWithContext(ctx context.Context, reqID uint32, resp ua.Response) error {
-	return s.sendResponseWithContext(ctx, nil, reqID, resp)
-}
-
-func (s *SecureChannel) SendMsgWithContext(ctx context.Context, instance *channelInstance, reqID uint32, resp any) error {
-	typeID := ua.ServiceTypeID(resp)
-	if typeID == 0 {
-		return errors.Errorf("uasc: unknown service %T. Did you call register?", resp)
-	}
-
-	var err error
-	if instance == nil {
-		instance, err = s.getActiveChannelInstance()
-		if err != nil {
-			return err
-		}
-	}
-
-	// we need to get a lock on the sequence number so we are sure to send them in the correct order.
-	instance.Lock()
-	defer instance.Unlock()
-
-	m := instance.newMessage(resp, typeID, reqID)
-	if _, err := s.writeMessageChunks(ctx, instance, reqID, m, resp); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (s *SecureChannel) sendResponseWithContext(ctx context.Context, instance *channelInstance, reqID uint32, resp ua.Response) error {
-	typeID := ua.ServiceTypeID(resp)
-	if typeID == 0 {
-		return errors.Errorf("uasc: unknown service %T. Did you call register?", resp)
-	}
-
-	var err error
-	if instance == nil {
-		instance, err = s.getActiveChannelInstance()
-		if err != nil {
-			return err
-		}
-	}
-	instance.Lock()
-	defer instance.Unlock()
-
-	m := instance.newMessage(resp, typeID, reqID)
-	if _, err := s.writeMessageChunks(ctx, instance, reqID, m, resp); err != nil {
-		return err
-	}
-
-	return nil
 }
 
 func (s *SecureChannel) nextRequestID() uint32 {

@@ -5,6 +5,7 @@
 package uapolicy
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -12,7 +13,8 @@ import (
 	"testing"
 
 	"github.com/gopcua/opcua/ua"
-	"github.com/stretchr/testify/require"
+
+	"github.com/pascaldekloe/goe/verify"
 )
 
 func TestSupportedPolicies(t *testing.T) {
@@ -22,23 +24,33 @@ func TestSupportedPolicies(t *testing.T) {
 		want = append(want, k)
 	}
 	sort.Strings(want)
-	require.Equal(t, want, got)
+	verify.Values(t, "", got, want)
 }
 
 func TestGenerateKeysLength(t *testing.T) {
 	localNonce := make([]byte, 32)
 	remoteNonce := make([]byte, 32)
 	_, err := rand.Read(localNonce)
-	require.NoError(t, err, "Could not generate local nonce")
+	if err != nil {
+		t.Fatalf("Could not generate local nonce")
+	}
 
 	_, err = rand.Read(remoteNonce)
-	require.NoError(t, err, "Could not generate remote nonce")
+	if err != nil {
+		t.Fatalf("Could not generate remote nonce")
+	}
 
 	hmac := &HMAC{Hash: crypto.SHA256, Secret: remoteNonce}
 	keys := generateKeys(hmac, localNonce, 32, 32, 16)
-	require.Equal(t, 32, len(keys.signing), "Signing Key Invalid Length")
-	require.Equal(t, 32, len(keys.encryption), "Encryption Key Invalid Length")
-	require.Equal(t, 16, len(keys.iv), "Encryption IV Invalid Length")
+	if len(keys.signing) != 32 {
+		t.Errorf("Signing Key Invalid Length\n")
+	}
+	if len(keys.encryption) != 32 {
+		t.Errorf("Encryption Key Invalid Length\n")
+	}
+	if len(keys.iv) != 16 {
+		t.Errorf("Encryption IV Invalid Length\n")
+	}
 }
 
 func TestGenerateKeys(t *testing.T) {
@@ -59,15 +71,27 @@ func TestGenerateKeys(t *testing.T) {
 
 	localHmac := &HMAC{Hash: crypto.SHA1, Secret: localNonce}
 	keys := generateKeys(localHmac, remoteNonce, 16, 16, 16)
-	require.Equal(t, localKeys.signing, keys.signing, "local signing key generation failed")
-	require.Equal(t, localKeys.encryption, keys.encryption, "local encryption key generation failed")
-	require.Equal(t, localKeys.iv, keys.iv, "local iv key generation failed")
+	if got, want := keys.signing, localKeys.signing; !bytes.Equal(got, want) {
+		t.Errorf("local signing key generation failed:\ngot %#v want %#v\n", got, want)
+	}
+	if got, want := keys.encryption, localKeys.encryption; !bytes.Equal(got, want) {
+		t.Errorf("local encryption key generation failed:\ngot %#v want %#v\n", got, want)
+	}
+	if got, want := keys.iv, localKeys.iv; !bytes.Equal(got, want) {
+		t.Errorf("local iv key generation failed:\ngot %#v want %#v\n", got, want)
+	}
 
 	remoteHmac := &HMAC{Hash: crypto.SHA1, Secret: remoteNonce}
 	keys = generateKeys(remoteHmac, localNonce, 16, 16, 16)
-	require.Equal(t, remoteKeys.signing, keys.signing, "remote signing key generation failed")
-	require.Equal(t, remoteKeys.encryption, keys.encryption, "remote encryption key generation failed")
-	require.Equal(t, remoteKeys.iv, keys.iv, "remote iv key generation failed")
+	if got, want := keys.signing, remoteKeys.signing; !bytes.Equal(got, want) {
+		t.Errorf("remote signing key generation failed:\ngot %#v want %#v\n", got, want)
+	}
+	if got, want := keys.encryption, remoteKeys.encryption; !bytes.Equal(got, want) {
+		t.Errorf("remote encryption key generation failed:\ngot %#v want %#v\n", got, want)
+	}
+	if got, want := keys.iv, remoteKeys.iv; !bytes.Equal(got, want) {
+		t.Errorf("remote iv key generation failed:\ngot %#v want %#v\n", got, want)
+	}
 }
 
 // Test all supported encryption algorithms.  Because the majority of the algorithms
@@ -78,7 +102,9 @@ func TestGenerateKeys(t *testing.T) {
 func TestEncryptionAlgorithms(t *testing.T) {
 	payload := make([]byte, 5000)
 	_, err := rand.Read(payload)
-	require.NoError(t, err, "could not generate random payload")
+	if err != nil {
+		t.Fatalf("could not generate random payload")
+	}
 
 	payloadRef := make([]byte, len(payload))
 	copy(payloadRef, payload)
@@ -87,15 +113,20 @@ func TestEncryptionAlgorithms(t *testing.T) {
 	// This won't be the case forever and will be too small for future algorithms
 	// and the test will need to be able to input keys of varying size
 	localKey, err := generatePrivateKey(2048)
-	require.NoError(t, err, "Unable to generate local private key")
-
+	if err != nil {
+		t.Fatalf("Unable to generate local private key\n")
+	}
 	remoteKey, err := generatePrivateKey(2048)
-	require.NoError(t, err, "Unable to generate remote private key")
+	if err != nil {
+		t.Fatalf("Unable to generate remote private key\n")
+	}
 
 	for uri, p := range policies {
 		t.Run(uri, func(t *testing.T) {
 			localAsymmetric, err := p.asymmetric(localKey, &remoteKey.PublicKey)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatal(err)
+			}
 
 			makeNonce := func(n int) []byte {
 				t.Helper()
@@ -103,23 +134,32 @@ func TestEncryptionAlgorithms(t *testing.T) {
 					return nil
 				}
 				b := make([]byte, n)
-				_, err = rand.Read(b)
-				require.NoError(t, err, "could not generate nonce")
+				if _, err = rand.Read(b); err != nil {
+					t.Fatalf("could not generate nonce")
+				}
 				return b
 			}
 
 			nonceLength := localAsymmetric.NonceLength()
 			localNonce, remoteNonce := makeNonce(nonceLength), makeNonce(nonceLength)
-			require.False(t, nonceLength == 0 && uri != ua.SecurityPolicyURINone, "client nonce length zero")
+			if nonceLength == 0 && uri != ua.SecurityPolicyURINone {
+				t.Fatalf("client nonce length zero")
+			}
 
 			localSymmetric, err := p.symmetric(localNonce, remoteNonce)
-			require.NoError(t, err, "failed local Symmetric: %s", err)
+			if err != nil {
+				t.Fatalf("failed local Symmetric: %s", err)
+			}
 
 			remoteSymmetric, err := p.symmetric(remoteNonce, localNonce)
-			require.NoError(t, err, "failed remote Symmetric: %s", err)
+			if err != nil {
+				t.Fatalf("failed remote Symmetric: %s", err)
+			}
 
 			remoteAsymmetric, err := p.asymmetric(remoteKey, &localKey.PublicKey)
-			require.NoError(t, err, "failed remote Asymmetric: %s", err)
+			if err != nil {
+				t.Fatalf("failed remote Asymmetric: %s", err)
+			}
 
 			// Symmetric Algorithm
 			plaintext := make([]byte, len(payload))
@@ -133,43 +173,64 @@ func TestEncryptionAlgorithms(t *testing.T) {
 			copy(paddedPlaintext, plaintext)
 
 			symCiphertext, err := localSymmetric.Encrypt(paddedPlaintext)
-			require.NoError(t, err, "failed to encrypt Symmetric: %s", err)
+			if err != nil {
+				t.Fatalf("failed to encrypt Symmetric: %s", err)
+			}
 
 			symDeciphered, err := remoteSymmetric.Decrypt(symCiphertext)
-			require.NoError(t, err, "failed to decrypt Symmetric: %s", err)
-
+			if err != nil {
+				t.Fatalf("failed to decrypt Symmetric: %s", err)
+			}
 			symDeciphered = symDeciphered[:len(symDeciphered)-padSize] // Trim off padding
-			require.Equal(t, plaintext, symDeciphered, "symmetric encryption failed")
+			if got, want := symDeciphered, plaintext; !bytes.Equal(got, want) {
+				t.Errorf("symmetric encryption failed:\ngot %#v want %#v\n", got, want)
+			}
 
 			// Modify the plaintext and detect if the decrypted message changes; if it does,
 			// our byte slices are referencing the same data and the previous test may have
 			// been a false positive
 			paddedPlaintext[4] = 0xff ^ paddedPlaintext[4]
-			require.Equal(t, payloadRef, symDeciphered, "symmetric input corruption detected")
+			if got, want := symDeciphered, payloadRef; !bytes.Equal(got, want) {
+				t.Errorf("symmetric input corruption detected:\ngot %#v want %#v\n", got, want)
+			}
 
 			symSignature, err := localSymmetric.Signature(paddedPlaintext)
-			require.NoError(t, err, "symmetric signature generation failed")
+			if err != nil {
+				t.Errorf("symmetric signature generation failed")
+			}
 
 			err = remoteSymmetric.VerifySignature(paddedPlaintext, symSignature)
-			require.NoError(t, err, "symmetric signature validation failed")
+			if err != nil {
+				t.Errorf("symmetric signature validation failed")
+			}
 
 			// Asymmetric Algorithm
 			asymCiphertext, err := localAsymmetric.Encrypt(plaintext)
-			require.NoError(t, err, "failed to encrypt Asymmetric: %s", err)
-
+			if err != nil {
+				t.Fatalf("failed to encrypt Asymmetric: %s", err)
+			}
 			asymDeciphered, err := remoteAsymmetric.Decrypt(asymCiphertext)
-			require.NoError(t, err, "failed to decrypt Asymmetric: %s", err)
-
-			require.Equal(t, plaintext, asymDeciphered, "asymmetric encryption failed")
+			if err != nil {
+				t.Fatalf("failed to decrypt Asymmetric: %s", err)
+			}
+			if got, want := asymDeciphered, plaintext; !bytes.Equal(got, want) {
+				t.Errorf("asymmetric encryption failed:\ngot %#v want %#v\n", got, want)
+			}
 
 			paddedPlaintext[4] = 0xff ^ paddedPlaintext[4]
-			require.Equal(t, payloadRef, asymDeciphered, "asymmetric input corruption detected")
+			if got, want := asymDeciphered, payloadRef; !bytes.Equal(got, want) {
+				t.Errorf("asymmetric input corruption detected:\ngot %#v want %#v\n", got, want)
+			}
 
 			asymSignature, err := localAsymmetric.Signature(plaintext)
-			require.NoError(t, err, "asymmetric signature generation failed")
+			if err != nil {
+				t.Errorf("asymmetric signature generation failed\n")
+			}
 
 			err = remoteAsymmetric.VerifySignature(plaintext, asymSignature)
-			require.NoError(t, err, "asymmetric signature validation failed")
+			if err != nil {
+				t.Errorf("asymmetric signature validation failed\n")
+			}
 		})
 	}
 }
@@ -177,13 +238,17 @@ func TestEncryptionAlgorithms(t *testing.T) {
 func TestMissingKey(t *testing.T) {
 	payload := make([]byte, 5000)
 	_, err := rand.Read(payload)
-	require.NoError(t, err, "could not generate random payload")
+	if err != nil {
+		t.Fatalf("could not generate random payload")
+	}
 
 	payloadRef := make([]byte, len(payload))
 	copy(payloadRef, payload)
 
 	key, err := generatePrivateKey(2048)
-	require.NoError(t, err, "Unable to generate private key")
+	if err != nil {
+		t.Fatalf("Unable to generate private key\n")
+	}
 
 	for uri, p := range policies {
 		if uri == ua.SecurityPolicyURINone {
@@ -192,58 +257,87 @@ func TestMissingKey(t *testing.T) {
 
 		t.Run(uri, func(t *testing.T) {
 			encryptOnly, err := p.asymmetric(nil, &key.PublicKey)
-			require.NoError(t, err, "failed to create encrypt-only asymmetric algorithms")
+			if err != nil {
+				t.Fatalf("failed to create encrypt-only asymmetric algorithms: %s", err)
+			}
 
 			decryptOnly, err := p.asymmetric(key, nil)
-			require.NoError(t, err, "failed to create decrypt-only asymmetric algorithms")
+			if err != nil {
+				t.Fatalf("failed to create decrypt-only asymmetric algorithms: %s", err)
+			}
 
 			ciphertext, err := encryptOnly.Encrypt(payload)
-			require.NoError(t, err, "failed to encrypt with encrypt-only policy")
+			if err != nil {
+				t.Fatalf("failed to encrypt with encrypt-only policy: %s", err)
+			}
 
 			signature, err := decryptOnly.Signature(payload)
-			require.NoError(t, err, "decrypt-only algorithm failed to generate signature")
+			if err != nil {
+				t.Fatalf("decrypt-only algorithm failed to generate signature: %s", err)
+			}
 
 			err = encryptOnly.VerifySignature(payload, signature)
-			require.NoError(t, err, "failed to verify signature with encrypt-only algorithm")
+			if err != nil {
+				t.Fatalf("failed to verify signature with encrypt-only algorithm: %s", err)
+			}
 
 			plaintext, err := decryptOnly.Decrypt(ciphertext)
-			require.NoError(t, err, "failed to decrypt with decrypt-only algorithm")
+			if err != nil {
+				t.Fatalf("failed to decrypt with decrypt-only algorithm: %s", err)
+			}
 
-			require.Equal(t, payloadRef, plaintext, "decryption failed")
+			if got, want := plaintext, payloadRef; !bytes.Equal(got, want) {
+				t.Errorf("decryption failed:\ngot %#v want %#v\n", got, want)
+			}
 
 			_, err = encryptOnly.Decrypt(ciphertext)
-			require.Error(t, err, "encrypt-only algorithm decrypted block without error - should be impossible")
+			if err == nil {
+				t.Fatal("encrypt-only algorithm decrypted block without error - should be impossible")
+			}
 
 			_, err = encryptOnly.Signature(payload)
-			require.Error(t, err, "encrypt-only algorithm generated a signature without error - should be impossible")
+			if err == nil {
+				t.Fatalf("encrypt-only algorithm generated a signature without error - should be impossible")
+			}
 
 			_, err = decryptOnly.Encrypt(payload)
-			require.Error(t, err, "decrypt-only algorithm encrypted block without error - should be impossible")
+			if err == nil {
+				t.Fatal("decrypt-only algorithm encrypted block without error - should be impossible")
+			}
 
 			err = decryptOnly.VerifySignature(payload, signature)
-			require.Error(t, err, "decrypt-only algorithm verified a signature without error - should be impossible")
+			if err == nil {
+				t.Fatalf("decrypt-only algorithm verified a signature without error - should be impossible")
+			}
+
 		})
 
 	}
 }
 
 func TestZeroStruct(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Error("panicked while checking zero value of struct", r)
+		}
+	}()
+
 	ze := &EncryptionAlgorithm{}
 
 	const payload string = "The quick brown fox jumps over the lazy dog."
 	plaintext := []byte(payload)
 
 	// Call all the methods and make sure they don't panic due to nil pointers
-	require.NotPanics(t, func() { ze.BlockSize() })
-	require.NotPanics(t, func() { ze.PlaintextBlockSize() })
-	require.NotPanics(t, func() { ze.Encrypt(plaintext) })
-	require.NotPanics(t, func() { ze.Decrypt(plaintext) })
-	require.NotPanics(t, func() { ze.Signature(plaintext) })
-	require.NotPanics(t, func() { ze.VerifySignature(plaintext, plaintext) })
-	require.NotPanics(t, func() { ze.NonceLength() })
-	require.NotPanics(t, func() { ze.SignatureLength() })
-	require.NotPanics(t, func() { ze.EncryptionURI() })
-	require.NotPanics(t, func() { ze.SignatureURI() })
+	_ = ze.BlockSize()
+	_ = ze.PlaintextBlockSize()
+	_, _ = ze.Encrypt(plaintext)
+	_, _ = ze.Decrypt(plaintext)
+	_, _ = ze.Signature(plaintext)
+	_ = ze.VerifySignature(plaintext, plaintext)
+	_ = ze.NonceLength()
+	_ = ze.SignatureLength()
+	_ = ze.EncryptionURI()
+	_ = ze.SignatureURI()
 }
 
 func generatePrivateKey(bitSize int) (*rsa.PrivateKey, error) {

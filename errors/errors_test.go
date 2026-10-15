@@ -1,23 +1,20 @@
 package errors
 
-import (
-	"errors"
-	"testing"
-
-	"github.com/stretchr/testify/require"
-)
+import "testing"
 
 func TestErrors(t *testing.T) {
-	t.Run("expand", func(t *testing.T) {
-		err := Errorf("hello %s", "world")
-		require.Error(t, err, errors.New("opcua: hello world"))
-	})
-	t.Run("simple", func(t *testing.T) {
-		err := New("hello")
-		require.Error(t, err, errors.New("opcua: hello"))
-	})
-	t.Run("parameter", func(t *testing.T) {
-		err := New("hello %s")
-		require.Error(t, err, errors.New("opcua: hello %s"))
-	})
+	err := Errorf("hello %s", "world")
+	if err.Error() != "opcua: hello world" {
+		t.Fatalf("got %s, wanted %s", err.Error(), "opcua: hello world")
+	}
+
+	err = New("hello")
+	if err.Error() != "opcua: hello" {
+		t.Fatalf("got %s, wanted %s", err.Error(), "opcua: hello")
+	}
+
+	err = New("hello %s")
+	if err.Error() != "opcua: hello %s" {
+		t.Fatalf("got %s, wanted %s", err.Error(), "opcua: %s")
+	}
 }

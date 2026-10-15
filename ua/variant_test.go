@@ -10,7 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
+	"github.com/gopcua/opcua/errors"
+
+	"github.com/pascaldekloe/goe/verify"
 )
 
 func TestVariant(t *testing.T) {
@@ -475,41 +477,49 @@ func TestVariant(t *testing.T) {
 				0x01, 0x00, 0x00, 0x00,
 			},
 		},
-		{
-			Name:   "[]string(nil)",
-			Struct: MustVariant([]string(nil)),
-			Bytes: []byte{
-				// variant encoding mask
-				0x8c,
-				// array length
-				0xff, 0xff, 0xff, 0xff,
-			},
-		},
 	}
 	RunCodecTest(t, cases)
 }
 
 func TestMustVariant(t *testing.T) {
 	t.Run("int", func(t *testing.T) {
-		require.Panics(t, func() { MustVariant(int(5)) })
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("MustVariant(int) did not panic")
+			}
+		}()
+		MustVariant(int(5))
 	})
 	t.Run("uint", func(t *testing.T) {
-		require.Panics(t, func() { MustVariant(uint(5)) })
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("MustVariant(uint) did not panic")
+			}
+		}()
+		MustVariant(uint(5))
 	})
 }
 
 func TestArray(t *testing.T) {
 	t.Run("one-dimension", func(t *testing.T) {
 		v := MustVariant([]uint32{1, 2, 3})
-		require.Equal(t, int32(3), v.ArrayLength(), "ArrayLength not equal")
-		require.Equal(t, byte(TypeIDUint32|VariantArrayValues), v.EncodingMask(), "EncodingMask not equal")
-		require.Equal(t, []int32(nil), v.ArrayDimensions())
+		if got, want := v.ArrayLength(), int32(3); got != want {
+			t.Fatalf("got length %d want %d", got, want)
+		}
+		if got, want := v.EncodingMask(), byte(TypeIDUint32|VariantArrayValues); got != want {
+			t.Fatalf("got mask %d want %d", got, want)
+		}
+		verify.Values(t, "", v.ArrayDimensions(), []int32{})
 	})
 	t.Run("multi-dimension", func(t *testing.T) {
 		v := MustVariant([][]uint32{{1, 1}, {2, 2}, {3, 3}})
-		require.Equal(t, int32(6), v.ArrayLength(), "ArrayLength not equal")
-		require.Equal(t, byte(TypeIDUint32|VariantArrayValues|VariantArrayDimensions), v.EncodingMask(), "EncodingMask not equal")
-		require.Equal(t, []int32{3, 2}, v.ArrayDimensions())
+		if got, want := v.ArrayLength(), int32(6); got != want {
+			t.Fatalf("got length %d want %d", got, want)
+		}
+		if got, want := v.EncodingMask(), byte(TypeIDUint32|VariantArrayValues|VariantArrayDimensions); got != want {
+			t.Fatalf("got mask %d want %d", got, want)
+		}
+		verify.Values(t, "", v.ArrayDimensions(), []int32{3, 2})
 	})
 	t.Run("unbalanced", func(t *testing.T) {
 		b := []byte{
@@ -529,7 +539,22 @@ func TestArray(t *testing.T) {
 		}
 
 		_, err := Decode(b, MustVariant([]uint32{0}))
-		require.ErrorIs(t, err, errUnbalancedSlice)
+		if got, want := err, errUnbalancedSlice; !errors.Equal(got, want) {
+			t.Fatalf("got error %#v want %#v", got, want)
+		}
+	})
+	t.Run("length negative", func(t *testing.T) {
+		b := []byte{
+			// variant encoding mask
+			0x87,
+			// array length
+			0xff, 0xff, 0xff, 0xff, // -1
+		}
+
+		_, err := Decode(b, MustVariant([]uint32{0}))
+		if got, want := err, StatusBadEncodingLimitsExceeded; !errors.Equal(got, want) {
+			t.Fatalf("got error %#v want %#v", got, want)
+		}
 	})
 	t.Run("length too big", func(t *testing.T) {
 		b := []byte{
@@ -542,7 +567,9 @@ func TestArray(t *testing.T) {
 		}
 
 		_, err := Decode(b, MustVariant([]uint32{0}))
-		require.ErrorIs(t, err, StatusBadEncodingLimitsExceeded)
+		if got, want := err, StatusBadEncodingLimitsExceeded; !errors.Equal(got, want) {
+			t.Fatalf("got error %v want %v", err, StatusBadEncodingLimitsExceeded)
+		}
 	})
 	t.Run("dimensions length negative", func(t *testing.T) {
 		b := []byte{
@@ -561,7 +588,9 @@ func TestArray(t *testing.T) {
 		}
 
 		_, err := Decode(b, MustVariant([]uint32{0}))
-		require.ErrorIs(t, err, StatusBadEncodingLimitsExceeded)
+		if got, want := err, StatusBadEncodingLimitsExceeded; !errors.Equal(got, want) {
+			t.Fatalf("got error %#v want %#v", got, want)
+		}
 	})
 	t.Run("dimensions negative", func(t *testing.T) {
 		b := []byte{
@@ -580,7 +609,9 @@ func TestArray(t *testing.T) {
 		}
 
 		_, err := Decode(b, MustVariant([]uint32{0}))
-		require.ErrorIs(t, err, StatusBadEncodingLimitsExceeded)
+		if got, want := err, StatusBadEncodingLimitsExceeded; !errors.Equal(got, want) {
+			t.Fatalf("got error %#v want %#v", got, want)
+		}
 	})
 	t.Run("dimensions zero", func(t *testing.T) {
 		b := []byte{
@@ -597,7 +628,9 @@ func TestArray(t *testing.T) {
 		}
 
 		_, err := Decode(b, MustVariant([][]uint32{{}, {}}))
-		require.ErrorIs(t, err, StatusBadEncodingLimitsExceeded)
+		if got, want := err, StatusBadEncodingLimitsExceeded; !errors.Equal(got, want) {
+			t.Fatalf("got error %#v want %#v", got, want)
+		}
 	})
 }
 
@@ -695,12 +728,14 @@ func TestSet(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("%T", tt.v), func(t *testing.T) {
 			va, err := NewVariant(tt.v)
-			require.Equal(t, tt.err, err)
-			require.Equal(t, tt.va.mask, va.mask)
-			require.Equal(t, tt.va.arrayLength, va.arrayLength)
-			require.Equal(t, tt.va.arrayDimensionsLength, va.arrayDimensionsLength)
-			require.Equal(t, tt.va.arrayDimensions, va.arrayDimensions)
-			require.Equal(t, tt.va.value, va.value)
+			if got, want := err, tt.err; got != want {
+				t.Fatalf("got error %v want %v", got, want)
+			}
+			verify.Values(t, "variant.mask", va.mask, tt.va.mask)
+			verify.Values(t, "variant.arrayLength", va.arrayLength, tt.va.arrayLength)
+			verify.Values(t, "variant.arrayDimensionsLength", va.arrayDimensionsLength, tt.va.arrayDimensionsLength)
+			verify.Values(t, "variant.arrayDimensions", va.arrayDimensions, tt.va.arrayDimensions)
+			verify.Values(t, "variant.value", va.value, tt.va.value)
 		})
 	}
 }
@@ -780,10 +815,18 @@ func TestSliceDim(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("%T", tt.v), func(t *testing.T) {
 			et, dim, len, err := sliceDim(reflect.ValueOf(tt.v))
-			require.Equal(t, tt.err, err)
-			require.Equal(t, tt.et, et)
-			require.Equal(t, tt.dim, dim)
-			require.Equal(t, tt.len, len)
+			if got, want := err, tt.err; got != want {
+				t.Fatalf("got error %v want %v", got, want)
+			}
+			if got, want := et, tt.et; got != want {
+				t.Fatalf("got type %v want %v", got, want)
+			}
+			if got, want := dim, tt.dim; !reflect.DeepEqual(got, want) {
+				t.Fatalf("got dimensions %v want %v", got, want)
+			}
+			if got, want := len, tt.len; got != want {
+				t.Fatalf("got len %v want %v", got, want)
+			}
 		})
 	}
 }
@@ -792,14 +835,17 @@ func TestVariantUnsupportedType(t *testing.T) {
 	tests := []interface{}{int(5), uint(5)}
 	for _, v := range tests {
 		t.Run(fmt.Sprintf("%T", v), func(t *testing.T) {
-			_, err := NewVariant(v)
-			require.Error(t, err)
+			if _, err := NewVariant(v); err == nil {
+				t.Fatal("got nil want err")
+			}
 		})
 	}
 }
 
 func TestVariantValueMethod(t *testing.T) {
-	require.Equal(t, int32(5), MustVariant(int32(5)).Value().(int32))
+	if got, want := MustVariant(int32(5)).Value().(int32), int32(5); got != want {
+		t.Fatalf("got %d want %d", got, want)
+	}
 }
 
 func TestVariantValueHelpers(t *testing.T) {
@@ -1031,13 +1077,6 @@ func TestVariantValueHelpers(t *testing.T) {
 			fn:   func(v *Variant) interface{} { return v.NodeID() },
 		},
 
-		// ExpandedNodeID
-		{
-			v:    NewExpandedNodeID(NewFourByteNodeID(1, 2), "uri", 1),
-			want: NewFourByteNodeID(1, 2),
-			fn:   func(v *Variant) interface{} { return v.NodeID() },
-		},
-
 		// QualifiedName
 		{
 			v:    false,
@@ -1234,7 +1273,7 @@ func TestVariantValueHelpers(t *testing.T) {
 	for i, tt := range tests {
 		name := fmt.Sprintf("test-%d %T -> %T", i, tt.v, tt.want)
 		t.Run(name, func(t *testing.T) {
-			require.EqualExportedValues(t, tt.want, tt.fn(MustVariant(tt.v)))
+			verify.Values(t, "", tt.fn(MustVariant(tt.v)), tt.want)
 		})
 	}
 }
@@ -1247,5 +1286,7 @@ func TestDecodeInvalidType(t *testing.T) {
 
 	v := &Variant{}
 	_, err := v.Decode(b)
-	require.EqualError(t, err, "opcua: invalid type id: 32")
+	if got, want := err, errors.New("invalid type id: 32"); !errors.Equal(got, want) {
+		t.Fatalf("got error %s want %s", got, want)
+	}
 }

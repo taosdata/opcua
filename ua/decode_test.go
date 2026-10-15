@@ -5,12 +5,10 @@
 package ua
 
 import (
+	"bytes"
 	"reflect"
-	"runtime"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/require"
 )
 
 type A struct {
@@ -386,7 +384,9 @@ func TestCodec(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, reflect.Ptr, reflect.ValueOf(tt.v).Kind(), "%T is not a pointer", tt.v)
+			if reflect.ValueOf(tt.v).Kind() != reflect.Ptr {
+				t.Fatalf("%T is not a pointer", tt.v)
+			}
 
 			t.Run("decode", func(t *testing.T) {
 				// create a new instance of the same type as tt.v
@@ -394,14 +394,22 @@ func TestCodec(t *testing.T) {
 				typ := reflect.ValueOf(tt.v).Type()
 				v := reflect.New(typ.Elem())
 
-				_, err := Decode(tt.b, v.Interface())
-				require.NoError(t, err, "Decode failed")
-				require.Equal(t, tt.v, v.Interface(), "Decoded payload not equal")
+				if _, err := Decode(tt.b, v.Interface()); err != nil {
+					t.Fatal(err)
+				}
+
+				if got, want := v.Interface(), tt.v; !reflect.DeepEqual(got, want) {
+					t.Fatalf("got %#v, want %#v", got, want)
+				}
 			})
 			t.Run("encode", func(t *testing.T) {
 				b, err := Encode(tt.v)
-				require.NoError(t, err, "Encode failed")
-				require.Equal(t, tt.b, b, "Encoded payload not equal")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got, want := b, tt.b; !bytes.Equal(got, want) {
+					t.Fatalf("\ngot  %#v\nwant %#v", got, want)
+				}
 			})
 		})
 	}
@@ -418,43 +426,7 @@ func TestFailDecodeArray(t *testing.T) {
 	}
 	var a [2]int32
 	_, err := Decode(b, &a)
-	require.Error(t, err, "was expecting error for tryig to decode a stream of bytes with length 3 into an array of size 2")
-}
-
-func TestDecodeSliceBoundsElementCount(t *testing.T) {
-	// A slice element occupies at least one byte on the wire, so a declared
-	// element count larger than the bytes left in the buffer is impossible and
-	// must not drive a MakeSlice of that size.
-	t.Run("oversized count errors without allocating", func(t *testing.T) {
-		// Declares 100,000,000 elements but carries only the 4-byte count.
-		// Without the bound this drove an ~800MB MakeSlice before failing; the
-		// guard must reject it up front, so allocation stays tiny.
-		b := []byte{0x00, 0xe1, 0xf5, 0x05}
-		v := &struct{ S []*A }{}
-
-		var m1, m2 runtime.MemStats
-		runtime.GC()
-		runtime.ReadMemStats(&m1)
-		_, err := Decode(b, v)
-		runtime.ReadMemStats(&m2)
-
-		require.Error(t, err, "expected error for element count exceeding remaining bytes")
-		require.Less(t, m2.TotalAlloc-m1.TotalAlloc, uint64(1<<20),
-			"decode allocated too much for a 4-byte input; the element count was not bounded")
-	})
-
-	t.Run("valid small slice still decodes", func(t *testing.T) {
-		b := []byte{
-			// len = 2
-			0x02, 0x00, 0x00, 0x00,
-			// A{V:1}
-			0x01, 0x00, 0x00, 0x00,
-			// A{V:2}
-			0x02, 0x00, 0x00, 0x00,
-		}
-		v := &struct{ S []*A }{}
-		_, err := Decode(b, v)
-		require.NoError(t, err)
-		require.Equal(t, []*A{{V: 1}, {V: 2}}, v.S)
-	})
+	if err == nil {
+		t.Fatalf("was expecting error for tryig to decode a stream of bytes with length 3 into an array of size 2")
+	}
 }

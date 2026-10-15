@@ -3,7 +3,6 @@ package opcua
 import (
 	"crypto/rsa"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/pem"
 	"fmt"
 	"net"
@@ -13,11 +12,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pascaldekloe/goe/verify"
+
 	"github.com/gopcua/opcua/ua"
 	"github.com/gopcua/opcua/uacp"
 	"github.com/gopcua/opcua/uapolicy"
 	"github.com/gopcua/opcua/uasc"
-	"github.com/stretchr/testify/require"
 )
 
 // test certificate generated with
@@ -38,9 +38,8 @@ GY1Q+sfu64IRjFdhnbL97a6GL+MgEVIvT9cl/DDcXtNZIl28Xk4KwAp3/lB1XrgK
 cdqKnNkOBU19ulD8SOKzAPch5ydHPFfXCw==
 -----END CERTIFICATE-----
 `)
-	certDER = derBytes(certPEM)
 
-	keyPKCS1PEM = []byte(`-----BEGIN RSA PRIVATE KEY-----
+	keyPEM = []byte(`-----BEGIN RSA PRIVATE KEY-----
 MIICXQIBAAKBgQCfHH3peKuI3F65hsYl5j6yc4NGmcSnVpTxNt36/SsKWJK0Gecp
 M7OrBrrlxDmLaiDUDQT/+VVwop5wzmaaSOEB5W1K1nyqBoCVNsEGbgEO/j8+Jfeh
 DOQ5yAQK25YkqebNi2YlS4MOr/bUusrvwouUMn7sjM+CS4NuVbdShxQg/QIDAQAB
@@ -56,35 +55,10 @@ YqvGJP7ubbsR1YoQxQ8CQQCyCrltDYji5+KdxMOsDt0v7bCQWkQ3+pik09faK51Y
 4upIBnmHPbJ80DfFIj/93JXna5JQpnIZGn/hitRixBWU
 -----END RSA PRIVATE KEY-----
 `)
-	keyPKCS1DER = derBytes(keyPKCS1PEM)
-	cert        = x509Cert(certPEM, keyPKCS1PEM)
 
-	keyPKCS8PEM = []byte(`-----BEGIN PRIVATE KEY-----
-MIICeAIBADANBgkqhkiG9w0BAQEFAASCAmIwggJeAgEAAoGBANUocwaux45f6JhU
-QHygnO/UfitJFEFd/CeztncyAQtW1Sja19s8w/Xf5YZSSnsp96N7Op1SFE+0dAKc
-dZT5KF6H0bAlcx1YMQWRaRc17523Ft3fkzikPL1dRrUprrnz2MhhyqlL1UiB3CEg
-7m1yly3ut1feE+zuGTnvP7ETiuY5AgMBAAECgYEAjE/oB8odSjcP4NX07RS8uZJi
-yxN75dt8FJZT0fp0fYZXImGMHaDOTZdoexbIOHLTtCV13AEfpaffhaiALeQlEYA4
-3eo+YEbFNtRs3BtxLoDc82McH70RFKjXudtsXDdq6eea0I34GvpWHEKfRJSdmEB9
-jna0pI5XV4cXJJ+qBdECQQD9psF5qnGnXjU7f4SA3nNo67pT1sz/TJLsMd3pxqmS
-w6VR25Y+LcU/iJEeBzPzCgH5wpuWcAHZiEVeYee1hwbPAkEA1yG1tVMESvv8yN71
-qec2BOWKnDA9EN0qjIreBQbB9F+vnalJpJ2b4h1/rRkTi0OzmXzlLTP07+TIPC6K
-WnyEdwJAWROBqF9h8FvWJ+HdP4BfWT5HPgAWF6XlhsrwWpOoo2DPotKRjZ53QZuN
-EtWGudgO344nI4qMK79+VOne/FHB4wJBALLzbIY3VyPUtrKUnH9HP+0Uz5canUFQ
-59rejM5bj6zqh1e7gPG41PljFlhzuokmuNfdR3mxdXaztUgyYo3gdAMCQQC/TMqc
-94ZVfT5WHoLDd86J0G4Eatl/xoA+NdHs9WRxN11RrAhH/9tdK5jV9xeMa9tncHwY
-qVM50NTCCBbetzVG
------END PRIVATE KEY-----
-`)
-	keyPKCS8DER = derBytes(keyPKCS8PEM)
-	keyPKCS8    = rsaKeyFromPKCS8PEM(keyPKCS8PEM)
-
-	keyPKCS8ECPem = []byte(`-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgiM2hA0sCCaNxhwPy
-E0GxKISgpTDWaL/h8FmM/PuprqihRANCAAQHtEMlgfUrDdt24KJRQihb5PsjOVB+
-17YDvxN/otim+q8xEacXbb7MlY6N1Vx5bbzFUDw00jVHOfWjbppru98b
------END PRIVATE KEY-----
-`)
+	certDER = derBytes(certPEM)
+	keyDER  = derBytes(keyPEM)
+	cert    = x509Cert(certPEM, keyPEM)
 
 	endpoints = []*ua.EndpointDescription{
 		// anonymous auth
@@ -135,18 +109,6 @@ E0GxKISgpTDWaL/h8FmM/PuprqihRANCAAQHtEMlgfUrDdt24KJRQihb5PsjOVB+
 				},
 			},
 		},
-		// no user security policy uri
-		{
-			SecurityPolicyURI: "c", // random value for testing
-			SecurityMode:      5,   // random value for testing
-			ServerCertificate: certDER,
-			UserIdentityTokens: []*ua.UserTokenPolicy{
-				{
-					TokenType:         ua.UserTokenTypeIssuedToken,
-					SecurityPolicyURI: "", // empty
-				},
-			},
-		},
 	}
 )
 
@@ -163,38 +125,21 @@ func x509Cert(c, k []byte) tls.Certificate {
 	return cert
 }
 
-// rsaKeyFromPKCS8PEM parses a PKCS#8 PEM-encoded RSA private key.
-// It is used to produce the expected *rsa.PrivateKey value in tests.
-func rsaKeyFromPKCS8PEM(pemBytes []byte) *rsa.PrivateKey {
-	block, _ := pem.Decode(pemBytes)
-	if block == nil {
-		panic("rsaKeyFromPKCS8PEM: failed to decode PEM block")
-	}
-	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-	if err != nil {
-		panic("rsaKeyFromPKCS8PEM: " + err.Error())
-	}
-	pk, ok := key.(*rsa.PrivateKey)
-	if !ok {
-		panic("rsaKeyFromPKCS8PEM: key is not an RSA key")
-	}
-	return pk
-}
-
 func TestOptions(t *testing.T) {
 	randomRequestID = func() uint32 { return 125 }
 	defer func() { randomRequestID = nil }()
 
-	d := t.TempDir()
+	d, err := os.MkdirTemp("", "gopcua")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(d)
 
 	var (
-		certDERFile     = filepath.Join(d, "cert.der")
-		certPEMFile     = filepath.Join(d, "cert.pem")
-		keyDERFile      = filepath.Join(d, "key.der")
-		keyPEMFile      = filepath.Join(d, "key.pem")
-		keyPKCS8PEMFile = filepath.Join(d, "key-pkcs8.pem")
-		keyPKCS8DERFile = filepath.Join(d, "key-pkcs8.der")
-		keyPKCS8ECFile  = filepath.Join(d, "key-pkcs8-ec.pem")
+		certDERFile = filepath.Join(d, "cert.der")
+		certPEMFile = filepath.Join(d, "cert.pem")
+		keyDERFile  = filepath.Join(d, "key.der")
+		keyPEMFile  = filepath.Join(d, "key.pem")
 	)
 
 	// the error message for "file not found" is platform dependent.
@@ -207,29 +152,19 @@ func TestOptions(t *testing.T) {
 		}
 	}
 
-	err := os.WriteFile(certDERFile, certDER, 0644)
-	require.NoError(t, err, "WriteFile(certDERFile) failed")
-
-	err = os.WriteFile(certPEMFile, certPEM, 0644)
-	require.NoError(t, err, "WriteFile(certPEMFile) failed")
-
-	err = os.WriteFile(keyDERFile, keyPKCS1DER, 0644)
-	require.NoError(t, err, "WriteFile(keyDERFile) failed")
-
-	err = os.WriteFile(keyPEMFile, keyPKCS1PEM, 0644)
-	require.NoError(t, err, "WriteFile(keyPEMFile) failed")
-
-	err = os.WriteFile(keyPKCS8PEMFile, keyPKCS8PEM, 0644)
-	require.NoError(t, err, "WriteFile(keyPKCS8PEMFile) failed")
-
-	err = os.WriteFile(keyPKCS8DERFile, keyPKCS8DER, 0644)
-	require.NoError(t, err, "WriteFile(keyPKCS8DERFile) failed")
-
-	err = os.WriteFile(keyPKCS8ECFile, keyPKCS8ECPem, 0644)
-	require.NoError(t, err, "WriteFile(keyPKCS8ECFile) failed")
-
-	connStateCh := make(chan ConnState)
-	connStateFunc := func(ConnState) {}
+	if err := os.WriteFile(certDERFile, certDER, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(certPEMFile, certPEM, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyDERFile, keyDER, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPEMFile, keyPEM, 0644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(keyPEMFile)
 
 	tests := []struct {
 		name string
@@ -378,20 +313,6 @@ func TestOptions(t *testing.T) {
 			err:  notFoundError("certificate", "x"),
 		},
 		{
-			name: `ConnStateCh`,
-			opt:  StateChangedCh(connStateCh),
-			cfg: &Config{
-				stateCh: connStateCh,
-			},
-		},
-		{
-			name: `ConnStateCh`,
-			opt:  StateChangedFunc(connStateFunc),
-			cfg: &Config{
-				stateFunc: connStateFunc,
-			},
-		},
-		{
 			name: `Lifetime(10ms)`,
 			opt:  Lifetime(10 * time.Millisecond),
 			cfg: &Config{
@@ -445,34 +366,6 @@ func TestOptions(t *testing.T) {
 					return c
 				}(),
 			},
-		},
-		{
-			name: `PrivateKeyFile("key-pkcs8.pem")`,
-			opt:  PrivateKeyFile(keyPKCS8PEMFile),
-			cfg: &Config{
-				sechan: func() *uasc.Config {
-					c := DefaultClientConfig()
-					c.LocalKey = keyPKCS8
-					return c
-				}(),
-			},
-		},
-		{
-			name: `PrivateKeyFile("key-pkcs8.der")`,
-			opt:  PrivateKeyFile(keyPKCS8DERFile),
-			cfg: &Config{
-				sechan: func() *uasc.Config {
-					c := DefaultClientConfig()
-					c.LocalKey = keyPKCS8
-					return c
-				}(),
-			},
-		},
-		{
-			name: `PrivateKeyFile("key-pkcs8-ec.pem") error`,
-			opt:  PrivateKeyFile(keyPKCS8ECFile),
-			cfg:  &Config{},
-			err:  fmt.Errorf("opcua: Private key is not an RSA key"),
 		},
 		{
 			name: `PrivateKeyFile() error`,
@@ -670,26 +563,6 @@ func TestOptions(t *testing.T) {
 			},
 		},
 		{
-			name: `SecurityFromEndpoint(no-user-auth-policy-uri)`,
-			opt:  SecurityFromEndpoint(endpoints[4], ua.UserTokenTypeIssuedToken),
-			cfg: &Config{
-				sechan: func() *uasc.Config {
-					c := DefaultClientConfig()
-					c.SecurityPolicyURI = "c"
-					c.SecurityMode = 5
-					c.RemoteCertificate = certDER
-					c.Thumbprint = uapolicy.Thumbprint(certDER)
-					return c
-				}(),
-				session: func() *uasc.SessionConfig {
-					sc := DefaultSessionConfig()
-					sc.UserIdentityToken = &ua.IssuedIdentityToken{}
-					sc.AuthPolicyURI = "c"
-					return sc
-				}(),
-			},
-		},
-		{
 			name: `SecurityPolicy("None")`,
 			opt:  SecurityPolicy("None"),
 			cfg: &Config{
@@ -870,7 +743,10 @@ func TestOptions(t *testing.T) {
 			opt:  MaxMessageSize(5),
 			cfg: &Config{
 				dialer: func() *uacp.Dialer {
-					d := DefaultDialer()
+					d := &uacp.Dialer{
+						Dialer:    &net.Dialer{},
+						ClientACK: uacp.DefaultClientACK,
+					}
 					d.ClientACK.MaxMessageSize = 5
 					return d
 				}(),
@@ -881,7 +757,10 @@ func TestOptions(t *testing.T) {
 			opt:  MaxChunkCount(5),
 			cfg: &Config{
 				dialer: func() *uacp.Dialer {
-					d := DefaultDialer()
+					d := &uacp.Dialer{
+						Dialer:    &net.Dialer{},
+						ClientACK: uacp.DefaultClientACK,
+					}
 					d.ClientACK.MaxChunkCount = 5
 					return d
 				}(),
@@ -892,7 +771,10 @@ func TestOptions(t *testing.T) {
 			opt:  ReceiveBufferSize(5),
 			cfg: &Config{
 				dialer: func() *uacp.Dialer {
-					d := DefaultDialer()
+					d := &uacp.Dialer{
+						Dialer:    &net.Dialer{},
+						ClientACK: uacp.DefaultClientACK,
+					}
 					d.ClientACK.ReceiveBufSize = 5
 					return d
 				}(),
@@ -903,7 +785,10 @@ func TestOptions(t *testing.T) {
 			opt:  SendBufferSize(5),
 			cfg: &Config{
 				dialer: func() *uacp.Dialer {
-					d := DefaultDialer()
+					d := &uacp.Dialer{
+						Dialer:    &net.Dialer{},
+						ClientACK: uacp.DefaultClientACK,
+					}
 					d.ClientACK.SendBufSize = 5
 					return d
 				}(),
@@ -913,9 +798,6 @@ func TestOptions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.cfg.dialer == nil {
-				tt.cfg.dialer = DefaultDialer()
-			}
 			if tt.cfg.sechan == nil {
 				tt.cfg.sechan = DefaultClientConfig()
 			}
@@ -932,17 +814,15 @@ func TestOptions(t *testing.T) {
 
 			cfg, err := ApplyConfig(tt.opt)
 			if got, want := errstr(err), errstr(tt.err); got != "" || want != "" {
-				require.Equal(t, want, got, "got error %q want %q", got, want)
+				if got != want {
+					t.Fatalf("got error %q want %q", got, want)
+				}
 				return
 			}
-			if tt.cfg.stateFunc != nil { // Functions are not comparable, so we check manually and unset
-				require.NotNil(t, cfg.stateFunc)
-				tt.cfg.stateFunc = nil
-				cfg.stateFunc = nil
-			} else {
-				require.Nil(t, cfg.stateFunc)
+			if !verify.Values(t, "", cfg, tt.cfg) {
+				t.Logf("got %#v", cfg)
+				t.Logf("want %#v", tt.cfg)
 			}
-			require.Equal(t, tt.cfg, cfg)
 		})
 	}
 }

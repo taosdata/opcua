@@ -68,8 +68,7 @@ type Dialer struct {
 
 func (d *Dialer) Dial(ctx context.Context, endpoint string) (*Conn, error) {
 	debug.Printf("uacp: connecting to %s", endpoint)
-
-	_, raddr, err := ResolveEndpoint(ctx, endpoint)
+	_, raddr, err := ResolveEndpoint(endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -77,10 +76,9 @@ func (d *Dialer) Dial(ctx context.Context, endpoint string) (*Conn, error) {
 	dl := d.Dialer
 	if dl == nil {
 		dl = &net.Dialer{}
-
 	}
 
-	c, err := dl.DialContext(ctx, "tcp", raddr.Host)
+	c, err := dl.DialContext(ctx, "tcp", raddr.String())
 	if err != nil {
 		return nil, err
 	}
@@ -120,22 +118,20 @@ type Listener struct {
 // If the IP field of laddr is nil or an unspecified IP address, Listen listens
 // on all available unicast and anycast IP addresses of the local system.
 // If the Port field of laddr is 0, a port number is automatically chosen.
-func Listen(ctx context.Context, endpoint string, ack *Acknowledge) (*Listener, error) {
+func Listen(endpoint string, ack *Acknowledge) (*Listener, error) {
 	if ack == nil {
 		ack = DefaultServerACK
 	}
-	_, laddr, err := ResolveEndpoint(ctx, endpoint)
+	network, laddr, err := ResolveEndpoint(endpoint)
 	if err != nil {
 		return nil, err
 	}
-
-	var lc net.ListenConfig
-	l, err := lc.Listen(ctx, "tcp", laddr.Host)
+	l, err := net.ListenTCP(network, laddr)
 	if err != nil {
 		return nil, err
 	}
 	return &Listener{
-		l:        l.(*net.TCPListener),
+		l:        l,
 		ack:      ack,
 		endpoint: endpoint,
 	}, nil
@@ -302,12 +298,10 @@ func (c *Conn) srvhandshake(endpoint string) error {
 			c.SendError(ua.StatusBadTCPInternalError)
 			return err
 		}
-		// TODO (dh): Temporarily disabled until a proper fix can be implemented.
-		// Problem is that when listening on a random port, (eg. :0), this check fails
-		//if hel.EndpointURL != endpoint {
-		//	c.SendError(ua.StatusBadTCPEndpointURLInvalid)
-		//	return fmt.Errorf("uacp: invalid endpoint url %s", hel.EndpointURL)
-		//}
+		if hel.EndpointURL != endpoint {
+			c.SendError(ua.StatusBadTCPEndpointURLInvalid)
+			return errors.Errorf("uacp: invalid endpoint url %s", hel.EndpointURL)
+		}
 		if err := c.Send("ACKF", c.ack); err != nil {
 			c.SendError(ua.StatusBadTCPInternalError)
 			return err

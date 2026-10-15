@@ -7,7 +7,6 @@ package uasc
 import (
 	"math"
 
-	"github.com/gopcua/opcua/debug"
 	"github.com/gopcua/opcua/errors"
 	"github.com/gopcua/opcua/ua"
 )
@@ -128,13 +127,6 @@ func (m *Message) EncodeChunks(maxBodySize uint32) ([][]byte, error) {
 
 	if dataBody.Error() != nil {
 		return nil, dataBody.Error()
-	}
-
-	// todo(fs): sometimes maxBodySize == 0 probably we get an invalid channel instance
-	// todo(fs): log this and investigate
-	if maxBodySize == 0 {
-		debug.Printf("maxBodySize == 0 !!!")
-		maxBodySize = 1 << 12
 	}
 
 	nrChunks := uint32(dataBody.Len())/(maxBodySize) + 1

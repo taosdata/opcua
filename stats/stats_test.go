@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/gopcua/opcua/ua"
-	"github.com/stretchr/testify/require"
+	"github.com/pascaldekloe/goe/verify"
 )
 
 func newExpVarInt(i int64) *expvar.Int {
@@ -20,13 +20,13 @@ func TestConvienienceFuncs(t *testing.T) {
 	Reset()
 
 	Client().Add("a", 1)
-	require.Equal(t, newExpVarInt(1), Client().Get("a"))
+	verify.Values(t, "", Client().Get("a"), newExpVarInt(1))
 
 	Error().Add("b", 2)
-	require.Equal(t, newExpVarInt(2), Error().Get("b"))
+	verify.Values(t, "", Error().Get("b"), newExpVarInt(2))
 
 	Subscription().Add("c", 3)
-	require.Equal(t, newExpVarInt(3), Subscription().Get("c"))
+	verify.Values(t, "", Subscription().Get("c"), newExpVarInt(3))
 }
 
 func TestRecordError(t *testing.T) {
@@ -46,7 +46,8 @@ func TestRecordError(t *testing.T) {
 		t.Run(tt.key, func(t *testing.T) {
 			s := NewStats()
 			s.RecordError(tt.err)
-			require.Equal(t, newExpVarInt(1), s.Error.Get(tt.key))
+			got, want := s.Error.Get(tt.key), newExpVarInt(1)
+			verify.Values(t, "", got, want)
 		})
 	}
 }

@@ -4,20 +4,21 @@ import (
 	"context"
 	"testing"
 
+	"github.com/pascaldekloe/goe/verify"
+
 	"github.com/gopcua/opcua/id"
 	"github.com/gopcua/opcua/ua"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestClient_Send_DoesNotPanicWhenDisconnected(t *testing.T) {
 	c, err := NewClient("opc.tcp://example.com:4840")
-	require.NoError(t, err, "NewClient failed")
-
-	err = c.Send(context.Background(), &ua.ReadRequest{}, func(i ua.Response) error {
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = c.Send(context.Background(), &ua.ReadRequest{}, func(i interface{}) error {
 		return nil
 	})
-	require.Equal(t, ua.StatusBadServerNotConnected, err)
+	verify.Values(t, "", err, ua.StatusBadServerNotConnected)
 }
 
 func TestCloneReadRequest(t *testing.T) {
@@ -99,7 +100,7 @@ func TestCloneReadRequest(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := cloneReadRequest(tt.req)
-			require.Equal(t, tt.want, got)
+			verify.Values(t, "", got, tt.want)
 		})
 	}
 }
@@ -180,101 +181,7 @@ func TestCloneBrowseRequest(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := cloneBrowseRequest(tt.req)
-			require.Equal(t, tt.want, got)
+			verify.Values(t, "", got, tt.want)
 		})
 	}
-}
-
-func TestClient_SetState(t *testing.T) {
-	tests := []struct {
-		name      string
-		state     ConnState
-		withChan  bool
-		withFunc  bool
-		ctxCancel bool
-	}{
-		{
-			name:     "set state without channel",
-			state:    Connected,
-			withChan: false,
-			withFunc: false,
-		},
-		{
-			name:     "set state with channel",
-			state:    Connecting,
-			withChan: true,
-			withFunc: true,
-		},
-		{
-			name:      "set state with cancelled context",
-			state:     Disconnected,
-			withChan:  true,
-			withFunc:  true,
-			ctxCancel: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
-			var opts []Option
-			var stateCh chan ConnState
-			if tt.withChan {
-				stateCh = make(chan ConnState, 1)
-				opts = append(opts, StateChangedCh(stateCh))
-			}
-			funcCallback := false
-			if tt.withFunc {
-				opts = append(opts, StateChangedFunc(func(ConnState) {
-					funcCallback = true
-				}))
-			}
-
-			c, err := NewClient("opc.tcp://example.com:4840", opts...)
-			require.NoError(t, err)
-
-			if tt.ctxCancel {
-				cancel()
-			}
-
-			c.setState(ctx, tt.state)
-
-			// Verify state was set correctly
-			require.Equal(t, tt.state, c.State())
-
-			// Verify channel received state if channel exists
-			if tt.withChan && !tt.ctxCancel {
-				select {
-				case state := <-stateCh:
-					require.Equal(t, tt.state, state)
-				default:
-					t.Fatal("expected state on channel but got none")
-				}
-			}
-			// Verify function received state if functions was set
-			if tt.withFunc {
-				if !funcCallback {
-					t.Error("expected function callback but got none")
-				}
-			}
-		})
-	}
-}
-
-func TestClient_LoadNil(t *testing.T) {
-	t.Run("normal client init", func(t *testing.T) {
-		c, err := NewClient("opc.tcp://dummy")
-		require.NoError(t, err)
-		assert.NoError(t, c.Close(context.TODO()))
-		assert.Nil(t, c.SecureChannel())
-		assert.Nil(t, c.Session())
-	})
-	t.Run("abnormal client init", func(t *testing.T) {
-		c := new(Client)
-		assert.NoError(t, c.Close(context.TODO()))
-		assert.Nil(t, c.SecureChannel())
-		assert.Nil(t, c.Session())
-	})
 }

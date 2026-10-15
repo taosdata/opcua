@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 	"log"
-	"slices"
 	"time"
 
 	"github.com/gopcua/opcua/debug"
@@ -12,6 +11,7 @@ import (
 	"github.com/gopcua/opcua/stats"
 	"github.com/gopcua/opcua/ua"
 	"github.com/gopcua/opcua/uasc"
+	"golang.org/x/exp/slices"
 )
 
 // Subscribe creates a Subscription with given parameters.
@@ -35,7 +35,7 @@ func (c *Client) Subscribe(ctx context.Context, params *SubscriptionParameters, 
 	}
 
 	var res *ua.CreateSubscriptionResponse
-	err := c.Send(ctx, req, func(v ua.Response) error {
+	err := c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	if err != nil {
@@ -72,7 +72,7 @@ func (c *Client) Subscribe(ctx context.Context, params *SubscriptionParameters, 
 	}
 
 	c.subs[sub.SubscriptionID] = sub
-	c.updatePublishTimeout_NeedsSubMuxLock()
+	c.updatePublishTimeout_NeedsSubMuxRLock()
 	return sub, nil
 }
 
@@ -89,7 +89,7 @@ func (c *Client) SubscriptionIDs() []uint32 {
 }
 
 // recreateSubscriptions creates new subscriptions
-// with the same parameters to replace the previous one
+// with the same parameters to replace the previous ones
 func (c *Client) recreateSubscription(ctx context.Context, id uint32) error {
 	c.subMux.Lock()
 	defer c.subMux.Unlock()
@@ -98,61 +98,7 @@ func (c *Client) recreateSubscription(ctx context.Context, id uint32) error {
 	if !ok {
 		return ua.StatusBadSubscriptionIDInvalid
 	}
-
-	sub.recreate_delete(ctx)
-
-	// the subscription stays registered under its old id until the replacement
-	// exists, so that a failed create leaves it for the reconnect loop to retry
-	// instead of dropping it. recreate_create only assigns the new id on
-	// success, so the old id is still the key to forget here.
-	if err := sub.recreate_create(ctx); err != nil {
-		return err
-	}
-	c.forgetSubscription_NeedsSubMuxLock(ctx, id)
-
-	if err := c.registerSubscription_NeedsSubMuxLock(sub); err != nil {
-		return err
-	}
-
-	return sub.recreate_monitoredItems(ctx)
-}
-
-// republishOrRecreateSubscriptions performs the restoreSubscriptions step of
-// the reconnect state machine. It republishes the subscriptions the server has
-// transferred to the new session and recreates the ones which could not be
-// transferred. Subscriptions for which the republish fails are recreated as
-// well.
-//
-// It returns the next reconnect action and the number of subscriptions which
-// are active again.
-//
-// The next action is none when every subscription was restored. If at least
-// one subscription could not be recreated the next action is recreateSession
-// so that the reconnect loop rebuilds the session and tries again instead of
-// leaving the client connected with a subscription that is gone.
-func (c *Client) republishOrRecreateSubscriptions(ctx context.Context, subsToRepublish, subsToRecreate []uint32, availableSeqs map[uint32][]uint32) (reconnectAction, int) {
-	dlog := debug.NewPrefixLogger("client: restoreSubscriptions: ")
-
-	action, activeSubs := none, 0
-
-	for _, subID := range subsToRepublish {
-		if err := c.republishSubscription(ctx, subID, availableSeqs[subID]); err != nil {
-			dlog.Printf("republish of subscription %d failed", subID)
-			subsToRecreate = append(subsToRecreate, subID)
-		}
-		activeSubs++
-	}
-
-	for _, subID := range subsToRecreate {
-		if err := c.recreateSubscription(ctx, subID); err != nil {
-			dlog.Printf("recreate subscription %d failed: %v", subID, err)
-			action = recreateSession
-			continue
-		}
-		activeSubs++
-	}
-
-	return action, activeSubs
+	return sub.recreate_NeedsSubMuxLock(ctx)
 }
 
 // transferSubscriptions ask the server to transfer the given subscriptions
@@ -164,7 +110,7 @@ func (c *Client) transferSubscriptions(ctx context.Context, ids []uint32) (*ua.T
 	}
 
 	var res *ua.TransferSubscriptionsResponse
-	err := c.Send(ctx, req, func(v ua.Response) error {
+	err := c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	return res, err
@@ -232,7 +178,7 @@ func (c *Client) sendRepublishRequests(ctx context.Context, sub *Subscription, a
 
 		debug.Printf("RepublishRequest: req=%s", debug.ToJSON(req))
 		var res *ua.RepublishResponse
-		err := sc.SendRequest(ctx, req, c.Session().resp.AuthenticationToken, func(v ua.Response) error {
+		err := c.SecureChannel().SendRequest(ctx, req, c.Session().resp.AuthenticationToken, func(v interface{}) error {
 			return safeAssign(v, &res)
 		})
 		debug.Printf("RepublishResponse: res=%s err=%v", debug.ToJSON(res), err)
@@ -257,26 +203,12 @@ func (c *Client) sendRepublishRequests(ctx context.Context, sub *Subscription, a
 				debug.Printf("Republishing subscription %d failed: %v", req.SubscriptionID, status)
 				return status
 			}
-
-			// Process the republished notification and advance sequence number
-			if res.NotificationMessage != nil {
-				c.notifySubscription(ctx, sub, res.NotificationMessage)
-				sub.lastSeq = res.NotificationMessage.SequenceNumber
-				sub.nextSeq = sub.lastSeq + 1
-				debug.Printf("Republished notification %d for subscription %d", res.NotificationMessage.SequenceNumber, sub.SubscriptionID)
-
-				if len(availableSeq) > 0 && !slices.Contains(availableSeq, sub.nextSeq) {
-					debug.Printf("Republishing subscription %d complete - no more sequences in buffer", sub.SubscriptionID)
-					return nil
-				}
-			}
 		}
-
 		time.Sleep(time.Second)
 	}
 }
 
-// registerSubscription_NeedsSubMuxLock registers a subscription while subMux is held.
+// registerSubscription_NeedsSubMuxLock registers a subscription
 func (c *Client) registerSubscription_NeedsSubMuxLock(sub *Subscription) error {
 	if sub.SubscriptionID == 0 {
 		return ua.StatusBadSubscriptionIDInvalid
@@ -290,7 +222,7 @@ func (c *Client) registerSubscription_NeedsSubMuxLock(sub *Subscription) error {
 	return nil
 }
 
-func (c *Client) ForgetSubscription(ctx context.Context, id uint32) {
+func (c *Client) forgetSubscription(ctx context.Context, id uint32) {
 	c.subMux.Lock()
 	c.forgetSubscription_NeedsSubMuxLock(ctx, id)
 	c.subMux.Unlock()
@@ -298,7 +230,7 @@ func (c *Client) ForgetSubscription(ctx context.Context, id uint32) {
 
 func (c *Client) forgetSubscription_NeedsSubMuxLock(ctx context.Context, id uint32) {
 	delete(c.subs, id)
-	c.updatePublishTimeout_NeedsSubMuxLock()
+	c.updatePublishTimeout_NeedsSubMuxRLock()
 	stats.Subscription().Add("Count", -1)
 
 	if len(c.subs) == 0 {
@@ -308,7 +240,7 @@ func (c *Client) forgetSubscription_NeedsSubMuxLock(ctx context.Context, id uint
 	}
 }
 
-func (c *Client) updatePublishTimeout_NeedsSubMuxLock() {
+func (c *Client) updatePublishTimeout_NeedsSubMuxRLock() {
 	maxTimeout := uasc.MaxTimeout
 	for _, s := range c.subs {
 		if d := s.publishTimeout(); d < maxTimeout {
@@ -538,7 +470,7 @@ func (c *Client) publish(ctx context.Context) error {
 		}
 
 		// handle the publish response for a specific subscription
-		c.handleNotification_NeedsSubMuxLock(sub, res)
+		c.handleNotification_NeedsSubMuxLock(ctx, sub, res)
 		c.subMux.Unlock()
 
 		c.notifySubscription(ctx, sub, res.NotificationMessage)
@@ -581,7 +513,7 @@ func (c *Client) handleAcks_NeedsSubMuxLock(res []ua.StatusCode) {
 	dlog.Printf("notAcked=%v", notAcked)
 }
 
-func (c *Client) handleNotification_NeedsSubMuxLock(sub *Subscription, res *ua.PublishResponse) {
+func (c *Client) handleNotification_NeedsSubMuxLock(ctx context.Context, sub *Subscription, res *ua.PublishResponse) {
 	dlog := debug.NewPrefixLogger("publish: sub %d: ", res.SubscriptionID)
 
 	// keep-alive message
@@ -617,7 +549,7 @@ func (c *Client) sendPublishRequest(ctx context.Context) (*ua.PublishResponse, e
 
 	dlog.Printf("PublishRequest: %s", debug.ToJSON(req))
 	var res *ua.PublishResponse
-	err := c.sendWithTimeout(ctx, req, c.publishTimeout(), func(v ua.Response) error {
+	err := c.sendWithTimeout(ctx, req, c.publishTimeout(), func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	stats.RecordError(err)

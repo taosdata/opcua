@@ -84,9 +84,10 @@ func GetEndpoints(ctx context.Context, endpoint string, opts ...Option) ([]*ua.E
 // SelectEndpoint returns the endpoint with the highest security level which matches
 // security policy and security mode. policy and mode can be omitted so that
 // only one of them has to match.
-func SelectEndpoint(endpoints []*ua.EndpointDescription, policy string, mode ua.MessageSecurityMode) (*ua.EndpointDescription, error) {
+// todo(fs): should this function return an error?
+func SelectEndpoint(endpoints []*ua.EndpointDescription, policy string, mode ua.MessageSecurityMode) *ua.EndpointDescription {
 	if len(endpoints) == 0 {
-		return nil, errors.Errorf("no endpoints available")
+		return nil
 	}
 
 	sort.Sort(sort.Reverse(bySecurityLevel(endpoints)))
@@ -94,26 +95,26 @@ func SelectEndpoint(endpoints []*ua.EndpointDescription, policy string, mode ua.
 
 	// don't care -> return highest security level
 	if policy == "" && mode == ua.MessageSecurityModeInvalid {
-		return endpoints[0], nil
+		return endpoints[0]
 	}
 
 	for _, p := range endpoints {
 		// match only security mode
 		if policy == "" && p.SecurityMode == mode {
-			return p, nil
+			return p
 		}
 
 		// match only security policy
 		if p.SecurityPolicyURI == policy && mode == ua.MessageSecurityModeInvalid {
-			return p, nil
+			return p
 		}
 
 		// match both
 		if p.SecurityPolicyURI == policy && p.SecurityMode == mode {
-			return p, nil
+			return p
 		}
 	}
-	return nil, errors.Errorf("no matching endpoint found for policy %s and mode %s", policy, mode)
+	return nil
 }
 
 type bySecurityLevel []*ua.EndpointDescription
@@ -121,21 +122,6 @@ type bySecurityLevel []*ua.EndpointDescription
 func (a bySecurityLevel) Len() int           { return len(a) }
 func (a bySecurityLevel) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a bySecurityLevel) Less(i, j int) bool { return a[i].SecurityLevel < a[j].SecurityLevel }
-
-type ClientInterface interface {
-	Browse(context.Context, *ua.BrowseRequest) (*ua.BrowseResponse, error)
-	BrowseNext(context.Context, *ua.BrowseNextRequest) (*ua.BrowseNextResponse, error)
-
-	Node(*ua.NodeID) *Node
-	NodeFromExpandedNodeID(*ua.ExpandedNodeID) *Node
-
-	Read(context.Context, *ua.ReadRequest) (*ua.ReadResponse, error)
-	Send(context.Context, ua.Request, func(ua.Response) error) error
-
-	ForgetSubscription(context.Context, uint32)
-
-	RequestTimeout() time.Duration
-}
 
 // Client is a high-level client for an OPC/UA server.
 // It establishes a secure channel and a session.
@@ -181,12 +167,6 @@ type Client struct {
 	// atomicState of the client
 	atomicState atomic.Value // ConnState
 
-	// stateCh is an optional channel for connection state changes. May be nil.
-	stateCh chan<- ConnState
-
-	// stateFunc is an optional func for connection state changes. May be nil.
-	stateFunc func(ConnState)
-
 	// list of cached atomicNamespaces on the server
 	atomicNamespaces atomic.Value // []string
 
@@ -218,13 +198,10 @@ func NewClient(endpoint string, opts ...Option) (*Client, error) {
 		pendingAcks: make([]*ua.SubscriptionAcknowledgement, 0),
 		pausech:     make(chan struct{}, 2),
 		resumech:    make(chan struct{}, 2),
-		stateCh:     cfg.stateCh,
-		stateFunc:   cfg.stateFunc,
 	}
 	c.pauseSubscriptions(context.Background())
 	c.setPublishTimeout(uasc.MaxTimeout)
-	// cannot use setState here since it would trigger the stateCh
-	c.atomicState.Store(Closed)
+	c.setState(Closed)
 	c.setSecureChannel(nil)
 	c.setSession(nil)
 	c.setNamespaces([]string{})
@@ -254,7 +231,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		return errors.Errorf("already connected")
 	}
 
-	c.setState(ctx, Connecting)
+	c.setState(Connecting)
 	if err := c.Dial(ctx); err != nil {
 		stats.RecordError(err)
 
@@ -275,7 +252,7 @@ func (c *Client) Connect(ctx context.Context) error {
 
 		return err
 	}
-	c.setState(ctx, Connected)
+	c.setState(Connected)
 
 	mctx, mcancel := context.WithCancel(context.Background())
 	c.mcancel = mcancel
@@ -306,7 +283,7 @@ func (c *Client) monitor(ctx context.Context) {
 	defer dlog.Printf("done")
 
 	defer c.mcancel()
-	defer c.setState(ctx, Closed)
+	defer c.setState(Closed)
 
 	action := none
 	for {
@@ -329,15 +306,12 @@ func (c *Client) monitor(ctx context.Context) {
 				continue
 			}
 
-			// StatusBadTooManyOperations is a service-level error and does
-			// not indicate that the connection is broken; skip it and
-			// continue the monitor loop instead of reconnecting.
 			if errors.Is(err, ua.StatusBadTooManyOperations) {
 				continue
 			}
 
 			// tell the handler the connection is disconnected
-			c.setState(ctx, Disconnected)
+			c.setState(Disconnected)
 			dlog.Print("disconnected")
 
 			if !c.cfg.sechan.AutoReconnect {
@@ -418,7 +392,7 @@ func (c *Client) monitor(ctx context.Context) {
 							c.setSecureChannel(nil)
 						}
 
-						c.setState(ctx, Reconnecting)
+						c.setState(Reconnecting)
 
 						dlog.Printf("trying to recreate secure channel")
 						for {
@@ -443,7 +417,7 @@ func (c *Client) monitor(ctx context.Context) {
 						// This only works if the session is still open on the server
 						// otherwise recreate it
 
-						c.setState(ctx, Reconnecting)
+						c.setState(Reconnecting)
 
 						s := c.Session()
 						if s == nil {
@@ -451,10 +425,6 @@ func (c *Client) monitor(ctx context.Context) {
 							action = recreateSession
 							continue
 						}
-
-						// clear the session from the client to prevent
-						// ActivateSession from closing it via CloseSession
-						c.setSession(nil)
 
 						dlog.Printf("trying to restore session")
 						if err := c.ActivateSession(ctx, s); err != nil {
@@ -478,7 +448,7 @@ func (c *Client) monitor(ctx context.Context) {
 					case recreateSession:
 						dlog.Printf("action: recreateSession")
 
-						c.setState(ctx, Reconnecting)
+						c.setState(Reconnecting)
 						// create a new session to replace the previous one
 
 						// clear any previous session as we know the server has closed it
@@ -565,22 +535,26 @@ func (c *Client) monitor(ctx context.Context) {
 						// Assume that subsToRecreate and subsToRepublish have been
 						// populated in the previous step.
 
-						action, activeSubs = c.republishOrRecreateSubscriptions(ctx, subsToRepublish, subsToRecreate, availableSeqs)
-						if action == none {
-							c.setState(ctx, Connected)
-							break
+						activeSubs = 0
+						for _, subID := range subsToRepublish {
+							if err := c.republishSubscription(ctx, subID, availableSeqs[subID]); err != nil {
+								dlog.Printf("republish of subscription %d failed", subID)
+								subsToRecreate = append(subsToRecreate, subID)
+							}
+							activeSubs++
 						}
 
-						// at least one subscription could not be recreated and action
-						// is recreateSession. back off before retrying so we don't
-						// hot-loop hammering the server when a subscription can never
-						// be restored (e.g. a monitored node was permanently removed
-						// from the server's address space).
-						select {
-						case <-ctx.Done():
-							return
-						case <-time.After(c.cfg.sechan.ReconnectInterval):
+						for _, subID := range subsToRecreate {
+							if err := c.recreateSubscription(ctx, subID); err != nil {
+								dlog.Printf("recreate subscripitions failed: %v", err)
+								action = recreateSession
+								continue
+							}
+							activeSubs++
 						}
+
+						c.setState(Connected)
+						action = none
 
 					case abortReconnect:
 						dlog.Printf("action: abortReconnect")
@@ -621,7 +595,8 @@ func (c *Client) Dial(ctx context.Context) error {
 	}
 
 	var err error
-	c.conn, err = c.cfg.dialer.Dial(ctx, c.endpointURL)
+	var d = NewDialer(c.cfg)
+	c.conn, err = d.Dial(ctx, c.endpointURL)
 	if err != nil {
 		return err
 	}
@@ -648,7 +623,7 @@ func (c *Client) Close(ctx context.Context) error {
 	// try to close the session but ignore any error
 	// so that we close the underlying channel and connection.
 	c.CloseSession(ctx)
-	c.setState(ctx, Closed)
+	c.setState(Closed)
 
 	if c.mcancel != nil {
 		c.mcancel()
@@ -680,17 +655,8 @@ func (c *Client) State() ConnState {
 	return c.atomicState.Load().(ConnState)
 }
 
-func (c *Client) setState(ctx context.Context, s ConnState) {
+func (c *Client) setState(s ConnState) {
 	c.atomicState.Store(s)
-	if c.stateCh != nil {
-		select {
-		case <-ctx.Done():
-		case c.stateCh <- s:
-		}
-	}
-	if c.stateFunc != nil {
-		c.stateFunc(s)
-	}
 	n := new(expvar.Int)
 	n.Set(int64(s))
 	stats.Client().Set("State", n)
@@ -717,11 +683,7 @@ func (c *Client) setPublishTimeout(d time.Duration) {
 // During reconnect this value can change.
 // Make sure to capture the value in a method before using it.
 func (c *Client) SecureChannel() *uasc.SecureChannel {
-	s, ok := c.atomicSechan.Load().(*uasc.SecureChannel)
-	if !ok {
-		return nil
-	}
-	return s
+	return c.atomicSechan.Load().(*uasc.SecureChannel)
 }
 
 func (c *Client) setSecureChannel(sc *uasc.SecureChannel) {
@@ -733,11 +695,7 @@ func (c *Client) setSecureChannel(sc *uasc.SecureChannel) {
 // During reconnect this value can change.
 // Make sure to capture the value in a method before using it.
 func (c *Client) Session() *Session {
-	s, ok := c.atomicSession.Load().(*Session)
-	if !ok {
-		return nil
-	}
-	return s
+	return c.atomicSession.Load().(*Session)
 }
 
 func (c *Client) setSession(s *Session) {
@@ -783,8 +741,7 @@ func (s *Session) RevisedTimeout() time.Duration {
 //
 // See Part 4, 5.6.2
 func (c *Client) CreateSession(ctx context.Context, cfg *uasc.SessionConfig) (*Session, error) {
-	sc := c.SecureChannel()
-	if sc == nil {
+	if c.SecureChannel() == nil {
 		return nil, ua.StatusBadServerNotConnected
 	}
 
@@ -809,14 +766,14 @@ func (c *Client) CreateSession(ctx context.Context, cfg *uasc.SessionConfig) (*S
 
 	var s *Session
 	// for the CreateSessionRequest the authToken is always nil.
-	// use sc.SendRequest() to enforce this.
-	err := sc.SendRequest(ctx, req, nil, func(v ua.Response) error {
+	// use c.SecureChannel().SendRequest() to enforce this.
+	err := c.SecureChannel().SendRequest(ctx, req, nil, func(v interface{}) error {
 		var res *ua.CreateSessionResponse
 		if err := safeAssign(v, &res); err != nil {
 			return err
 		}
 
-		err := sc.VerifySessionSignature(res.ServerCertificate, nonce, res.ServerSignature.Signature)
+		err := c.SecureChannel().VerifySessionSignature(res.ServerCertificate, nonce, res.ServerSignature.Signature)
 		if err != nil {
 			log.Printf("error verifying session signature: %s", err)
 			return nil
@@ -875,12 +832,11 @@ func anonymousPolicyID(endpoints []*ua.EndpointDescription) string {
 //
 // See Part 4, 5.6.3
 func (c *Client) ActivateSession(ctx context.Context, s *Session) error {
-	sc := c.SecureChannel()
-	if sc == nil {
+	if c.SecureChannel() == nil {
 		return ua.StatusBadServerNotConnected
 	}
 	stats.Client().Add("ActivateSession", 1)
-	sig, sigAlg, err := sc.NewSessionSignature(s.serverCertificate, s.serverNonce)
+	sig, sigAlg, err := c.SecureChannel().NewSessionSignature(s.serverCertificate, s.serverNonce)
 	if err != nil {
 		log.Printf("error creating session signature: %s", err)
 		return nil
@@ -891,7 +847,7 @@ func (c *Client) ActivateSession(ctx context.Context, s *Session) error {
 		// nothing to do
 
 	case *ua.UserNameIdentityToken:
-		pass, passAlg, err := sc.EncryptUserPassword(s.cfg.AuthPolicyURI, s.cfg.AuthPassword, s.serverCertificate, s.serverNonce)
+		pass, passAlg, err := c.SecureChannel().EncryptUserPassword(s.cfg.AuthPolicyURI, s.cfg.AuthPassword, s.serverCertificate, s.serverNonce)
 		if err != nil {
 			log.Printf("error encrypting user password: %s", err)
 			return err
@@ -900,7 +856,7 @@ func (c *Client) ActivateSession(ctx context.Context, s *Session) error {
 		tok.EncryptionAlgorithm = passAlg
 
 	case *ua.X509IdentityToken:
-		tokSig, tokSigAlg, err := sc.NewUserTokenSignature(s.cfg.AuthPolicyURI, s.serverCertificate, s.serverNonce)
+		tokSig, tokSigAlg, err := c.SecureChannel().NewUserTokenSignature(s.cfg.AuthPolicyURI, s.serverCertificate, s.serverNonce)
 		if err != nil {
 			log.Printf("error creating session signature: %s", err)
 			return err
@@ -924,7 +880,7 @@ func (c *Client) ActivateSession(ctx context.Context, s *Session) error {
 		UserIdentityToken:          ua.NewExtensionObject(s.cfg.UserIdentityToken),
 		UserTokenSignature:         s.cfg.UserTokenSignature,
 	}
-	return sc.SendRequest(ctx, req, s.resp.AuthenticationToken, func(v ua.Response) error {
+	return c.SecureChannel().SendRequest(ctx, req, s.resp.AuthenticationToken, func(v interface{}) error {
 		var res *ua.ActivateSessionResponse
 		if err := safeAssign(v, &res); err != nil {
 			return err
@@ -966,7 +922,7 @@ func (c *Client) closeSession(ctx context.Context, s *Session) error {
 	}
 	req := &ua.CloseSessionRequest{DeleteSubscriptions: true}
 	var res *ua.CloseSessionResponse
-	return c.Send(ctx, req, func(v ua.Response) error {
+	return c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 }
@@ -984,7 +940,7 @@ func (c *Client) DetachSession(ctx context.Context) (*Session, error) {
 // Send sends the request via the secure channel and registers a handler for
 // the response. If the client has an active session it injects the
 // authentication token.
-func (c *Client) Send(ctx context.Context, req ua.Request, h func(ua.Response) error) error {
+func (c *Client) Send(ctx context.Context, req ua.Request, h func(interface{}) error) error {
 	stats.Client().Add("Send", 1)
 
 	err := c.sendWithTimeout(ctx, req, c.cfg.sechan.RequestTimeout, h)
@@ -996,7 +952,7 @@ func (c *Client) Send(ctx context.Context, req ua.Request, h func(ua.Response) e
 // sendWithTimeout sends the request via the secure channel with a custom timeout and registers a handler for
 // the response. If the client has an active session it injects the
 // authentication token.
-func (c *Client) sendWithTimeout(ctx context.Context, req ua.Request, timeout time.Duration, h uasc.ResponseHandler) error {
+func (c *Client) sendWithTimeout(ctx context.Context, req ua.Request, timeout time.Duration, h func(interface{}) error) error {
 	sc := c.SecureChannel()
 	if sc == nil {
 		return ua.StatusBadServerNotConnected
@@ -1005,20 +961,20 @@ func (c *Client) sendWithTimeout(ctx context.Context, req ua.Request, timeout ti
 	if s := c.Session(); s != nil {
 		authToken = s.resp.AuthenticationToken
 	}
-	return sc.SendRequestWithTimeout(ctx, req, authToken, timeout, h)
+	return c.SecureChannel().SendRequestWithTimeout(ctx, req, authToken, timeout, h)
 }
 
 // Node returns a node object which accesses its attributes
 // through this client connection.
 func (c *Client) Node(id *ua.NodeID) *Node {
-	return NewNode(id, c)
+	return &Node{ID: id, c: c}
 }
 
 // NodeFromExpandedNodeID returns a node object which accesses its attributes
 // through this client connection. This is usually needed when working with node ids returned
 // from browse responses by the server.
 func (c *Client) NodeFromExpandedNodeID(id *ua.ExpandedNodeID) *Node {
-	return NewNode(ua.NewNodeIDFromExpandedNodeID(id), c)
+	return &Node{ID: ua.NewNodeIDFromExpandedNodeID(id), c: c}
 }
 
 // FindServers finds the servers available at an endpoint
@@ -1029,7 +985,7 @@ func (c *Client) FindServers(ctx context.Context) (*ua.FindServersResponse, erro
 		EndpointURL: c.endpointURL,
 	}
 	var res *ua.FindServersResponse
-	err := c.Send(ctx, req, func(v ua.Response) error {
+	err := c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	return res, err
@@ -1041,7 +997,7 @@ func (c *Client) FindServersOnNetwork(ctx context.Context) (*ua.FindServersOnNet
 
 	req := &ua.FindServersOnNetworkRequest{}
 	var res *ua.FindServersOnNetworkResponse
-	err := c.Send(ctx, req, func(v ua.Response) error {
+	err := c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	return res, err
@@ -1055,7 +1011,7 @@ func (c *Client) GetEndpoints(ctx context.Context) (*ua.GetEndpointsResponse, er
 		EndpointURL: c.endpointURL,
 	}
 	var res *ua.GetEndpointsResponse
-	err := c.Send(ctx, req, func(v ua.Response) error {
+	err := c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	return res, err
@@ -1094,27 +1050,24 @@ func (c *Client) Read(ctx context.Context, req *ua.ReadRequest) (*ua.ReadRespons
 	req = cloneReadRequest(req)
 
 	var res *ua.ReadResponse
-	err := c.Send(ctx, req, func(v ua.Response) error {
+	err := c.Send(ctx, req, func(v interface{}) error {
 		err := safeAssign(v, &res)
 		if err != nil {
 			return err
 		}
 
 		// If the client cannot decode an extension object then its
-		// value will be nil or contain its raw body. Since the EO is known to the
+		// value will be nil. However, since the EO was known to the
 		// server the StatusCode for that data value will be OK. We
-		// therefore check for extension objects with nil or raw values and set
+		// therefore check for extension objects with nil values and set
 		// the status code to StatusBadDataTypeIDUnknown.
 		for _, dv := range res.Results {
 			if dv.Value == nil {
 				continue
 			}
 			val := dv.Value.Value()
-			if eo, ok := val.(*ua.ExtensionObject); ok {
-				_, raw := eo.Value.([]byte)
-				if eo.Value == nil || raw {
-					dv.Status = ua.StatusBadDataTypeIDUnknown
-				}
+			if eo, ok := val.(*ua.ExtensionObject); ok && eo.Value == nil {
+				dv.Status = ua.StatusBadDataTypeIDUnknown
 			}
 		}
 		return nil
@@ -1128,7 +1081,7 @@ func (c *Client) Write(ctx context.Context, req *ua.WriteRequest) (*ua.WriteResp
 	stats.Client().Add("NodesToWrite", int64(len(req.NodesToWrite)))
 
 	var res *ua.WriteResponse
-	err := c.Send(ctx, req, func(v ua.Response) error {
+	err := c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	return res, err
@@ -1168,7 +1121,7 @@ func (c *Client) Browse(ctx context.Context, req *ua.BrowseRequest) (*ua.BrowseR
 	req = cloneBrowseRequest(req)
 
 	var res *ua.BrowseResponse
-	err := c.Send(ctx, req, func(v ua.Response) error {
+	err := c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	return res, err
@@ -1182,7 +1135,7 @@ func (c *Client) Call(ctx context.Context, req *ua.CallMethodRequest) (*ua.CallM
 		MethodsToCall: []*ua.CallMethodRequest{req},
 	}
 	var res *ua.CallResponse
-	err := c.Send(ctx, creq, func(v ua.Response) error {
+	err := c.Send(ctx, creq, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	if err != nil {
@@ -1199,7 +1152,7 @@ func (c *Client) BrowseNext(ctx context.Context, req *ua.BrowseNextRequest) (*ua
 	stats.Client().Add("BrowseNext", 1)
 
 	var res *ua.BrowseNextResponse
-	err := c.Send(ctx, req, func(v ua.Response) error {
+	err := c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	return res, err
@@ -1213,7 +1166,7 @@ func (c *Client) RegisterNodes(ctx context.Context, req *ua.RegisterNodesRequest
 	stats.Client().Add("NodesToRegister", int64(len(req.NodesToRegister)))
 
 	var res *ua.RegisterNodesResponse
-	err := c.Send(ctx, req, func(v ua.Response) error {
+	err := c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	return res, err
@@ -1227,7 +1180,7 @@ func (c *Client) UnregisterNodes(ctx context.Context, req *ua.UnregisterNodesReq
 	stats.Client().Add("NodesToUnregister", int64(len(req.NodesToUnregister)))
 
 	var res *ua.UnregisterNodesResponse
-	err := c.Send(ctx, req, func(v ua.Response) error {
+	err := c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	return res, err
@@ -1250,7 +1203,7 @@ func (c *Client) HistoryReadEvent(ctx context.Context, nodes []*ua.HistoryReadVa
 	}
 
 	var res *ua.HistoryReadResponse
-	err := c.Send(ctx, req, func(v ua.Response) error {
+	err := c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	return res, err
@@ -1273,7 +1226,7 @@ func (c *Client) HistoryReadRawModified(ctx context.Context, nodes []*ua.History
 	}
 
 	var res *ua.HistoryReadResponse
-	err := c.Send(ctx, req, func(v ua.Response) error {
+	err := c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	return res, err
@@ -1296,7 +1249,7 @@ func (c *Client) HistoryReadProcessed(ctx context.Context, nodes []*ua.HistoryRe
 	}
 
 	var res *ua.HistoryReadResponse
-	err := c.Send(ctx, req, func(v ua.Response) error {
+	err := c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	return res, err
@@ -1319,7 +1272,7 @@ func (c *Client) HistoryReadAtTime(ctx context.Context, nodes []*ua.HistoryReadV
 	}
 
 	var res *ua.HistoryReadResponse
-	err := c.Send(ctx, req, func(v ua.Response) error {
+	err := c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	return res, err
@@ -1365,10 +1318,6 @@ func (c *Client) UpdateNamespaces(ctx context.Context) error {
 	}
 	c.setNamespaces(ns)
 	return nil
-}
-
-func (c *Client) RequestTimeout() time.Duration {
-	return c.cfg.sechan.RequestTimeout
 }
 
 // safeAssign implements a type-safe assign from T to *T.
