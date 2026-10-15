@@ -11,14 +11,16 @@ import (
 	"time"
 
 	"github.com/gopcua/opcua/errors"
-	"github.com/stretchr/testify/require"
+	"github.com/pascaldekloe/goe/verify"
 )
 
 func TestConn(t *testing.T) {
 	t.Run("server exists ", func(t *testing.T) {
 		ep := "opc.tcp://127.0.0.1:4840/foo/bar"
-		ln, err := Listen(context.Background(), ep, nil)
-		require.NoError(t, err)
+		ln, err := Listen(ep, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer ln.Close()
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -43,9 +45,9 @@ func TestConn(t *testing.T) {
 		select {
 		case <-done:
 		case err := <-acceptErr:
-			require.Fail(t, "accept fail: %v", err)
+			t.Fatalf("accept fail: %v", err)
 		case <-time.After(time.Second):
-			require.Fail(t, "timed out")
+			t.Fatal("timed out")
 		}
 	})
 
@@ -64,8 +66,10 @@ func TestConn(t *testing.T) {
 
 func TestClientWrite(t *testing.T) {
 	ep := "opc.tcp://127.0.0.1:4840/foo/bar"
-	ln, err := Listen(context.Background(), ep, nil)
-	require.NoError(t, err, "Listen failed")
+	ln, err := Listen(ep, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer ln.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -86,40 +90,49 @@ func TestClientWrite(t *testing.T) {
 	}()
 
 	cliConn, err := Dial(ctx, ep)
-	require.NoError(t, err, "Dial failed")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	for {
 		select {
 		case _, ok := <-done:
-			require.True(t, ok, "failed to setup secure channel")
+			if !ok {
+				t.Fatal("failed to setup secure channel")
+			}
 			goto NEXT
 		case err := <-acceptErr:
-			require.Fail(t, "accept fail: %v", err)
+			t.Fatalf("accept fail: %v", err)
 		case <-time.After(time.Second):
-			require.Fail(t, "timed out")
+			t.Fatal("timed out")
 		}
 	}
 
 NEXT:
 	msg := &Message{Data: []byte{0xde, 0xad, 0xbe, 0xef}}
-	err = cliConn.Send("MSGF", msg)
-	require.NoError(t, err, "Send failed")
+	if err := cliConn.Send("MSGF", msg); err != nil {
+		t.Fatal(err)
+	}
 
 	got, err := srvConn.Receive()
-	require.NoError(t, err, "Receive failed")
-
+	if err != nil {
+		t.Fatal(err)
+	}
 	got = got[hdrlen:]
 
 	want, err := msg.Encode()
-	require.NoError(t, err, "Encode failed")
-
-	require.Equal(t, want, got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verify.Values(t, "", got, want)
 }
 
 func TestServerWrite(t *testing.T) {
 	ep := "opc.tcp://127.0.0.1:4840/foo/bar"
-	ln, err := Listen(context.Background(), ep, nil)
-	require.NoError(t, err, "Listen failed")
+	ln, err := Listen(ep, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer ln.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -140,29 +153,35 @@ func TestServerWrite(t *testing.T) {
 	}()
 
 	cliConn, err := Dial(ctx, ep)
-	require.NoError(t, err, "Dial failed")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	for {
 		select {
 		case _, ok := <-done:
-			require.True(t, ok, "failed to setup secure channel")
+			if !ok {
+				t.Fatal("failed to setup secure channel")
+			}
 			goto NEXT
 		case err := <-acceptErr:
-			require.Fail(t, "accept fail: %v", err)
+			t.Fatalf("accept fail: %v", err)
 		case <-time.After(time.Second):
-			require.Fail(t, "timed out")
+			t.Fatal("timed out")
 		}
 	}
 
 NEXT:
 	want := []byte{0xde, 0xad, 0xbe, 0xef}
-	_, err = srvConn.Write(want)
-	require.NoError(t, err, "Write failed")
+	if _, err := srvConn.Write(want); err != nil {
+		t.Fatal(err)
+	}
 
 	got := make([]byte, cliConn.ReceiveBufSize())
 	n, err := cliConn.Read(got)
-	require.NoError(t, err, "Read failed")
-
+	if err != nil {
+		t.Fatal(err)
+	}
 	got = got[:n]
-	require.Equal(t, want, got)
+	verify.Values(t, "", got, want)
 }

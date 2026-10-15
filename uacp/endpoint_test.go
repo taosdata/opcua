@@ -5,10 +5,7 @@
 package uacp
 
 import (
-	"context"
-	"github.com/stretchr/testify/require"
-	_ "github.com/stretchr/testify/require"
-	"net/url"
+	"net"
 	"testing"
 )
 
@@ -16,37 +13,33 @@ func TestResolveEndpoint(t *testing.T) {
 	cases := []struct {
 		input   string
 		network string
-		u       *url.URL
+		addr    *net.TCPAddr
 		errStr  string
 	}{
 		{ // Valid, full EndpointURL
 			"opc.tcp://10.0.0.1:4840/foo/bar",
 			"tcp",
-			&url.URL{
-				Scheme: "opc.tcp",
-				Host:   "10.0.0.1:4840",
-				Path:   "/foo/bar",
+			&net.TCPAddr{
+				IP:   net.IP([]byte{0x0a, 0x00, 0x00, 0x01}),
+				Port: 4840,
 			},
 			"",
 		},
 		{ // Valid, port number omitted
 			"opc.tcp://10.0.0.1/foo/bar",
 			"tcp",
-			&url.URL{
-				Scheme: "opc.tcp",
-				Host:   "10.0.0.1:4840",
-				Path:   "/foo/bar",
+			&net.TCPAddr{
+				IP:   net.IP([]byte{0x0a, 0x00, 0x00, 0x01}),
+				Port: 4840,
 			},
 			"",
 		},
 		{ // Valid, hostname resolved
-			// note: see https://github.com/cunnie/sslip.io
-			"opc.tcp://www.1.1.1.1.sslip.io:4840/foo/bar",
+			"opc.tcp://localhost:4840/foo/bar",
 			"tcp",
-			&url.URL{
-				Scheme: "opc.tcp",
-				Host:   "1.1.1.1:4840",
-				Path:   "/foo/bar",
+			&net.TCPAddr{
+				IP:   net.IP([]byte{0x7f, 0x00, 0x00, 0x01}),
+				Port: 4840,
 			},
 			"",
 		},
@@ -54,23 +47,30 @@ func TestResolveEndpoint(t *testing.T) {
 			"tcp://10.0.0.1:4840/foo/bar",
 			"",
 			nil,
-			"opcua: unsupported scheme tcp",
+			"opcua: invalid endpoint tcp://10.0.0.1:4840/foo/bar",
 		},
 		{ // Invalid, bad formatted schema
 			"opc.tcp:/10.0.0.1:4840/foo1337bar/baz",
 			"",
 			nil,
-			"lookup : no such host",
+			"opcua: could not resolve address foo1337bar:4840",
 		},
 	}
 
 	for _, c := range cases {
-		network, u, err := ResolveEndpoint(context.Background(), c.input)
-		if c.errStr != "" {
-			require.EqualError(t, err, c.errStr)
-		} else {
-			require.Equal(t, c.network, network)
-			require.Equal(t, c.u, u)
+		var errStr string
+		network, addr, err := ResolveEndpoint(c.input)
+		if err != nil {
+			errStr = err.Error()
+		}
+		if got, want := network, c.network; got != want {
+			t.Fatalf("got network %q want %q", got, want)
+		}
+		if got, want := addr.String(), c.addr.String(); got != want {
+			t.Fatalf("got addr %q want %q", got, want)
+		}
+		if got, want := errStr, c.errStr; got != want {
+			t.Fatalf("got error %q want %q", got, want)
 		}
 	}
 }

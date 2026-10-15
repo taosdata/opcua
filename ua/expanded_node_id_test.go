@@ -6,10 +6,10 @@ package ua
 
 import (
 	"math"
+	"reflect"
 	"testing"
 
 	"github.com/gopcua/opcua/errors"
-	"github.com/stretchr/testify/require"
 )
 
 func TestExpandedNodeID(t *testing.T) {
@@ -101,8 +101,12 @@ func TestParseExpandedNodeID(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.s, func(t *testing.T) {
 			n, err := ParseExpandedNodeID(c.s, c.ns)
-			require.Equal(t, c.err, err, "Errors not equal")
-			require.Equal(t, c.n, n, "ExpandedNodeID not equal")
+			if got, want := err, c.err; !errors.Equal(got, want) {
+				t.Fatalf("got error %v want %v", got, want)
+			}
+			if got, want := n, c.n; !reflect.DeepEqual(got, want) {
+				t.Fatalf("\ngot  %#v\nwant %#v", got, want)
+			}
 		})
 	}
 }

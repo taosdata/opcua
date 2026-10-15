@@ -1,1 +1,0 @@
-this package is for testing the gopcua client against the gopcua server

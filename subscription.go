@@ -3,7 +3,6 @@ package opcua
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
@@ -23,6 +22,8 @@ const (
 	DefaultSubscriptionPriority                   = 0
 )
 
+const terminatedSubscriptionID uint32 = 0xC0CAC01B
+
 type Subscription struct {
 	SubscriptionID            uint32
 	RevisedPublishingInterval time.Duration
@@ -30,12 +31,11 @@ type Subscription struct {
 	RevisedMaxKeepAliveCount  uint32
 	Notifs                    chan<- *PublishNotificationData
 	params                    *SubscriptionParameters
-	paramsMu                  sync.Mutex
 	items                     map[uint32]*monitoredItem
 	itemsMu                   sync.Mutex
 	lastSeq                   uint32
 	nextSeq                   uint32
-	c                         ClientInterface
+	c                         *Client
 }
 
 type SubscriptionParameters struct {
@@ -83,7 +83,7 @@ type PublishNotificationData struct {
 // from the client and the server.
 func (s *Subscription) Cancel(ctx context.Context) error {
 	stats.Subscription().Add("Cancel", 1)
-	s.c.ForgetSubscription(ctx, s.SubscriptionID)
+	s.c.forgetSubscription(ctx, s.SubscriptionID)
 	return s.delete(ctx)
 }
 
@@ -94,7 +94,7 @@ func (s *Subscription) delete(ctx context.Context) error {
 	}
 
 	var res *ua.DeleteSubscriptionsResponse
-	err := s.c.Send(ctx, req, func(v ua.Response) error {
+	err := s.c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 
@@ -111,45 +111,11 @@ func (s *Subscription) delete(ctx context.Context) error {
 	}
 }
 
-func (s *Subscription) ModifySubscription(ctx context.Context, params SubscriptionParameters) (*ua.ModifySubscriptionResponse, error) {
-	stats.Subscription().Add("ModifySubscription", 1)
-
-	params.setDefaults()
-	req := &ua.ModifySubscriptionRequest{
-		SubscriptionID:              s.SubscriptionID,
-		RequestedPublishingInterval: float64(params.Interval.Milliseconds()),
-		RequestedLifetimeCount:      params.LifetimeCount,
-		RequestedMaxKeepAliveCount:  params.MaxKeepAliveCount,
-		MaxNotificationsPerPublish:  params.MaxNotificationsPerPublish,
-		Priority:                    params.Priority,
-	}
-
-	var res *ua.ModifySubscriptionResponse
-	err := s.c.Send(ctx, req, func(v ua.Response) error {
-		return safeAssign(v, &res)
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	// update subscription parameters
-	s.paramsMu.Lock()
-	s.params = &params
-	s.paramsMu.Unlock()
-	// update revised subscription parameters
-	s.RevisedPublishingInterval = time.Duration(res.RevisedPublishingInterval) * time.Millisecond
-	s.RevisedLifetimeCount = res.RevisedLifetimeCount
-	s.RevisedMaxKeepAliveCount = res.RevisedMaxKeepAliveCount
-
-	return res, nil
-}
-
 func (s *Subscription) Monitor(ctx context.Context, ts ua.TimestampsToReturn, items ...*ua.MonitoredItemCreateRequest) (*ua.CreateMonitoredItemsResponse, error) {
 	stats.Subscription().Add("Monitor", 1)
 	stats.Subscription().Add("MonitoredItems", int64(len(items)))
 
-	// Part 4, 5.13.2.2 CreateMonitoredItems Service Parameters
+	// Part 4, 5.12.2.2 CreateMonitoredItems Service Parameters
 	req := &ua.CreateMonitoredItemsRequest{
 		SubscriptionID:     s.SubscriptionID,
 		TimestampsToReturn: ts,
@@ -157,7 +123,7 @@ func (s *Subscription) Monitor(ctx context.Context, ts ua.TimestampsToReturn, it
 	}
 
 	var res *ua.CreateMonitoredItemsResponse
-	err := s.c.Send(ctx, req, func(v ua.Response) error {
+	err := s.c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 
@@ -190,7 +156,7 @@ func (s *Subscription) Unmonitor(ctx context.Context, monitoredItemIDs ...uint32
 	}
 
 	var res *ua.DeleteMonitoredItemsResponse
-	err := s.c.Send(ctx, req, func(v ua.Response) error {
+	err := s.c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	if err != nil {
@@ -232,9 +198,7 @@ func (s *Subscription) ModifyMonitoredItems(ctx context.Context, ts ua.Timestamp
 		ItemsToModify:      items,
 	}
 	var res *ua.ModifyMonitoredItemsResponse
-
-	err = s.c.Send(ctx, req, func(v ua.Response) error {
-
+	err = s.c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	if err != nil {
@@ -286,7 +250,7 @@ func (s *Subscription) SetMonitoringMode(ctx context.Context, monitoringMode ua.
 		MonitoredItemIDs: monitoredItemIDs,
 	}
 	var res *ua.SetMonitoringModeResponse
-	err = s.c.Send(ctx, req, func(v ua.Response) error {
+	err = s.c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	if err != nil {
@@ -302,7 +266,7 @@ func (s *Subscription) SetMonitoringMode(ctx context.Context, monitoringMode ua.
 func (s *Subscription) SetTriggering(ctx context.Context, triggeringItemID uint32, add, remove []uint32) (*ua.SetTriggeringResponse, error) {
 	stats.Subscription().Add("SetTriggering", 1)
 
-	// Part 4, 5.13.5.2 SetTriggering Service Parameters
+	// Part 4, 5.12.5.2 SetTriggering Service Parameters
 	req := &ua.SetTriggeringRequest{
 		SubscriptionID:   s.SubscriptionID,
 		TriggeringItemID: triggeringItemID,
@@ -311,7 +275,7 @@ func (s *Subscription) SetTriggering(ctx context.Context, triggeringItemID uint3
 	}
 
 	var res *ua.SetTriggeringResponse
-	err := s.c.Send(ctx, req, func(v ua.Response) error {
+	err := s.c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	return res, err
@@ -322,8 +286,8 @@ func (s *Subscription) publishTimeout() time.Duration {
 	if timeout > uasc.MaxTimeout {
 		return uasc.MaxTimeout
 	}
-	if requestTimeout := s.c.RequestTimeout(); timeout < requestTimeout {
-		return requestTimeout
+	if timeout < s.c.cfg.sechan.RequestTimeout {
+		return s.c.cfg.sechan.RequestTimeout
 	}
 	return timeout
 }
@@ -392,32 +356,29 @@ func (p *SubscriptionParameters) setDefaults() {
 	}
 }
 
-// recreate_delete is called by the client when it is trying to
-// recreate an existing subscription. This function deletes the
-// existing subscription from the server.
-func (s *Subscription) recreate_delete(ctx context.Context) error {
-	dlog := debug.NewPrefixLogger("sub %d: recreate_delete: ", s.SubscriptionID)
-	req := &ua.DeleteSubscriptionsRequest{
-		SubscriptionIDs: []uint32{s.SubscriptionID},
+// recreate_NeedsSubMuxLock creates a new subscription based on the previous subscription
+// parameters and monitored items.
+func (s *Subscription) recreate_NeedsSubMuxLock(ctx context.Context) error {
+	dlog := debug.NewPrefixLogger("sub %d: recreate: ", s.SubscriptionID)
+
+	if s.SubscriptionID == terminatedSubscriptionID {
+		dlog.Printf("subscription is not in a valid state")
+		return nil
 	}
-	var res *ua.DeleteSubscriptionsResponse
-	_ = s.c.Send(ctx, req, func(v ua.Response) error {
-		return safeAssign(v, &res)
-	})
-	dlog.Print("subscription deleted")
-	return nil
-}
 
-// recreate_create is called by the client when it is trying to
-// recreate an existing subscription. This function creates a
-// new subscription with the same parameters as the previous one.
-// The client registers the recreated subscription immediately afterwards.
-func (s *Subscription) recreate_create(ctx context.Context) error {
-	dlog := debug.NewPrefixLogger("sub %d: recreate_create: ", s.SubscriptionID)
-
-	s.paramsMu.Lock()
 	params := s.params
-	s.paramsMu.Unlock()
+	{
+		req := &ua.DeleteSubscriptionsRequest{
+			SubscriptionIDs: []uint32{s.SubscriptionID},
+		}
+		var res *ua.DeleteSubscriptionsResponse
+		_ = s.c.Send(ctx, req, func(v interface{}) error {
+			return safeAssign(v, &res)
+		})
+		dlog.Print("subscription deleted")
+	}
+	s.c.forgetSubscription_NeedsSubMuxLock(ctx, s.SubscriptionID)
+	dlog.Printf("subscription forgotton")
 
 	req := &ua.CreateSubscriptionRequest{
 		RequestedPublishingInterval: float64(params.Interval / time.Millisecond),
@@ -428,7 +389,7 @@ func (s *Subscription) recreate_create(ctx context.Context) error {
 		Priority:                    params.Priority,
 	}
 	var res *ua.CreateSubscriptionResponse
-	err := s.c.Send(ctx, req, func(v ua.Response) error {
+	err := s.c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	if err != nil {
@@ -449,19 +410,10 @@ func (s *Subscription) recreate_create(ctx context.Context) error {
 	s.lastSeq = 0
 	s.nextSeq = 1
 
-	return nil
-}
-
-// recreate_monitoredItems restores monitored items after the recreated
-// subscription has been registered by the client.
-//
-// Part 4, 5.13.2.4 (Table 65) defines the status code of a
-// MonitoredItemCreateResult as an operation-level result for that item: an
-// item the server rejects, e.g. with Bad_NodeIdUnknown because the node is
-// gone, does not fail the restore. It is dropped and logged and the remaining
-// items are restored.
-func (s *Subscription) recreate_monitoredItems(ctx context.Context) error {
-	dlog := debug.NewPrefixLogger("sub %d: recreate_monitoredItems: ", s.SubscriptionID)
+	if err := s.c.registerSubscription_NeedsSubMuxLock(s); err != nil {
+		return err
+	}
+	dlog.Printf("subscription registered")
 
 	// Sort by timestamp to return
 	itemsByTimestamps := make(map[ua.TimestampsToReturn][]*ua.MonitoredItemCreateRequest)
@@ -469,12 +421,8 @@ func (s *Subscription) recreate_monitoredItems(ctx context.Context) error {
 	for _, mi := range s.items {
 		itemsByTimestamps[mi.ts] = append(itemsByTimestamps[mi.ts], mi.req)
 	}
-	prevCount := len(s.items)
+	s.items = make(map[uint32]*monitoredItem, len(s.items))
 	s.itemsMu.Unlock()
-
-	// the previous items stay in place until every request has been answered so
-	// that a failed request leaves them for the next reconnect attempt to send.
-	restored := make(map[uint32]*monitoredItem, prevCount)
 
 	for ts, items := range itemsByTimestamps {
 		req := &ua.CreateMonitoredItemsRequest{
@@ -484,7 +432,7 @@ func (s *Subscription) recreate_monitoredItems(ctx context.Context) error {
 		}
 
 		var res *ua.CreateMonitoredItemsResponse
-		err := s.c.Send(ctx, req, func(v ua.Response) error {
+		err := s.c.Send(ctx, req, func(v interface{}) error {
 			return safeAssign(v, &res)
 		})
 		if err != nil {
@@ -492,46 +440,23 @@ func (s *Subscription) recreate_monitoredItems(ctx context.Context) error {
 			return err
 		}
 
-		// Part 4, 5.13.2.2: the size and order of the results match the size
-		// and order of itemsToCreate.
-		if len(res.Results) != len(items) {
-			return errors.Errorf("sub %d: got %d results for %d monitored items", s.SubscriptionID, len(res.Results), len(items))
+		for _, result := range res.Results {
+			if status := result.StatusCode; status != ua.StatusOK {
+				return status
+			}
 		}
 
+		s.itemsMu.Lock()
 		for i, item := range items {
-			result := res.Results[i]
-			if status := result.StatusCode; status != ua.StatusOK {
-				// not dlog: losing a monitored item across a reconnect is
-				// data the caller stops receiving, so it has to be visible
-				// without debug logging turned on.
-				log.Printf("sub %d: dropping monitored item %s on recreate: %v", s.SubscriptionID, monitoredNodeID(item), status)
-				continue
-			}
-			restored[result.MonitoredItemID] = &monitoredItem{
+			s.items[res.Results[i].MonitoredItemID] = &monitoredItem{
 				req: item,
-				res: result,
+				res: res.Results[i],
 				ts:  ts,
 			}
 		}
-	}
-
-	s.itemsMu.Lock()
-	s.items = restored
-	s.itemsMu.Unlock()
-
-	if len(restored) != prevCount {
-		dlog.Printf("recreated with %d of %d monitored items", len(restored), prevCount)
-		return nil
+		s.itemsMu.Unlock()
 	}
 	dlog.Printf("subscription successfully recreated")
 
 	return nil
-}
-
-// monitoredNodeID returns the node id a monitored item watches for logging.
-func monitoredNodeID(item *ua.MonitoredItemCreateRequest) *ua.NodeID {
-	if item == nil || item.ItemToMonitor == nil {
-		return nil
-	}
-	return item.ItemToMonitor.NodeID
 }

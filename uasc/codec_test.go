@@ -11,7 +11,7 @@ import (
 	"testing"
 
 	"github.com/gopcua/opcua/ua"
-	"github.com/stretchr/testify/require"
+	"github.com/pascaldekloe/goe/verify"
 )
 
 // CodecTestCase describes a test case for a encoding and decoding an
@@ -39,23 +39,26 @@ func RunCodecTest(t *testing.T, cases []CodecTestCase) {
 				case reflect.Slice:
 					v = reflect.New(typ) // typ: []x, v: *[]x
 				default:
-					require.Fail(t, "%T is not a pointer or a slice", c.Struct)
+					t.Fatalf("%T is not a pointer or a slice", c.Struct)
 				}
 
-				_, err := ua.Decode(c.Bytes, v.Interface())
-				require.NoError(t, err, "Decode failed")
+				if _, err := ua.Decode(c.Bytes, v.Interface()); err != nil {
+					t.Fatal(err)
+				}
 
 				// if v is a *[]x we need to dereference it before comparing it.
 				if typ.Kind() == reflect.Slice {
 					v = v.Elem()
 				}
-				require.Equal(t, c.Struct, v.Interface(), "Decoded payload not equal")
+				verify.Values(t, "", v.Interface(), c.Struct)
 			})
 
 			t.Run("encode", func(t *testing.T) {
 				b, err := ua.Encode(c.Struct)
-				require.NoError(t, err, "Encode failed")
-				require.Equal(t, c.Bytes, b, "Encoded payload not equal")
+				if err != nil {
+					t.Fatal(err)
+				}
+				verify.Values(t, "", b, c.Bytes)
 			})
 		})
 	}
