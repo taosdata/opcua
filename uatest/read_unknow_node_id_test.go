@@ -4,6 +4,7 @@
 package uatest
 
 import (
+	"bytes"
 	"context"
 	"testing"
 
@@ -41,8 +42,16 @@ func TestReadUnknowNodeID(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got, want := resp.Results[0].Status, ua.StatusBadDataTypeIDUnknown; got != want {
+	if got, want := resp.Results[0].Status, ua.StatusOK; got != want {
 		t.Errorf("got status %v want %v for a node with an unknown type", got, want)
+	}
+	extension, ok := resp.Results[0].Value.Value().(*ua.ExtensionObject)
+	if !ok {
+		t.Fatalf("unknown type was not preserved as an ExtensionObject: %T", resp.Results[0].Value.Value())
+	}
+	body, ok := extension.Value.([]byte)
+	if !ok || !bytes.Equal(body, make([]byte, 8)) {
+		t.Fatalf("unknown binary body was not preserved: %v", extension.Value)
 	}
 
 	// check that the connection is still usable by reading another node.

@@ -25,6 +25,7 @@ import (
 	"github.com/gopcua/opcua/ua"
 	"github.com/gopcua/opcua/uacp"
 	"github.com/gopcua/opcua/uasc"
+	"golang.org/x/exp/slices"
 )
 
 // FindServers returns the servers known to a server or discovery server.
@@ -360,6 +361,7 @@ func (c *Client) monitor(ctx context.Context) {
 				subsToRecreate  []uint32            // subscription ids which need to be recreated as new subscriptions
 				availableSeqs   map[uint32][]uint32 // available sequence numbers per subscription
 				activeSubs      int                 // number of active subscriptions to resume/recreate
+				discardSession  bool
 			)
 
 			for action != none {
@@ -429,10 +431,19 @@ func (c *Client) monitor(ctx context.Context) {
 						dlog.Printf("trying to restore session")
 						if err := c.ActivateSession(ctx, s); err != nil {
 							dlog.Printf("restore session failed: %v", err)
+							select {
+							case <-ctx.Done():
+								return
+							case <-time.After(c.cfg.sechan.ReconnectInterval):
+							}
 							action = recreateSession
 							continue
 						}
 						dlog.Printf("session restored")
+						if discardSession {
+							action = recreateSession
+							continue
+						}
 
 						// todo(fs): see comment about guarding this with an option in Connect()
 						dlog.Printf("trying to update namespaces")
@@ -443,6 +454,13 @@ func (c *Client) monitor(ctx context.Context) {
 						}
 						dlog.Printf("namespaces updated")
 
+						subsToRepublish = nil
+						for _, id := range c.SubscriptionIDs() {
+							if !slices.Contains(subsToRecreate, id) {
+								subsToRepublish = append(subsToRepublish, id)
+							}
+						}
+						availableSeqs = nil
 						action = restoreSubscriptions
 
 					case recreateSession:
@@ -451,9 +469,12 @@ func (c *Client) monitor(ctx context.Context) {
 						c.setState(Reconnecting)
 						// create a new session to replace the previous one
 
-						// clear any previous session as we know the server has closed it
-						// this also prevents any unnecessary calls to CloseSession
+						if err := c.closeSession(ctx, c.Session(), discardSession); err != nil && !errors.Is(err, ua.StatusBadSessionIDInvalid) && !errors.Is(err, ua.StatusBadSessionClosed) {
+							action = createSecureChannel
+							continue
+						}
 						c.setSession(nil)
+						discardSession = false
 
 						dlog.Printf("trying to recreate session")
 						s, err := c.CreateSession(ctx, c.cfg.session)
@@ -462,6 +483,7 @@ func (c *Client) monitor(ctx context.Context) {
 							action = createSecureChannel
 							continue
 						}
+						c.setSession(s)
 						if err := c.ActivateSession(ctx, s); err != nil {
 							dlog.Printf("reactivate session failed: %v", err)
 							action = createSecureChannel
@@ -543,16 +565,42 @@ func (c *Client) monitor(ctx context.Context) {
 							}
 							activeSubs++
 						}
+						subsToRepublish = nil
 
+						var retry []uint32
 						for _, subID := range subsToRecreate {
-							if err := c.recreateSubscription(ctx, subID); err != nil {
+							id, err := c.recreateSubscription(ctx, subID)
+							if err != nil {
 								dlog.Printf("recreate subscripitions failed: %v", err)
-								action = recreateSession
+								retry = append(retry, id)
+								var status ua.StatusCode
+								if errors.Is(err, errSubscriptionIDUnknown) {
+									discardSession = true
+									action = recreateSession
+								} else if errors.Is(err, ua.StatusBadSessionIDInvalid) || errors.Is(err, ua.StatusBadSessionClosed) {
+									action = recreateSession
+								} else if !errors.As(err, &status) || status == ua.StatusBadServerNotConnected || status == ua.StatusBadSecureChannelIDInvalid || status == ua.StatusBadTimeout {
+									action = createSecureChannel
+								}
 								continue
 							}
 							activeSubs++
 						}
+						subsToRecreate = retry
+						if len(retry) > 0 {
+							activeSubs = len(c.SubscriptionIDs()) - len(retry)
+							if action == restoreSubscriptions && activeSubs > 0 {
+								c.resumeSubscriptions(ctx)
+							}
+							select {
+							case <-ctx.Done():
+								return
+							case <-time.After(c.cfg.sechan.ReconnectInterval):
+							}
+							continue
+						}
 
+						activeSubs = len(c.SubscriptionIDs())
 						c.setState(Connected)
 						action = none
 
@@ -896,7 +944,9 @@ func (c *Client) ActivateSession(ctx context.Context, s *Session) error {
 		// We decided not to check the error of CloseSession() since we
 		// can't do much about it anyway and it creates a race in the
 		// re-connection logic.
-		c.CloseSession(ctx)
+		if c.Session() != s {
+			c.CloseSession(ctx)
+		}
 
 		c.setSession(s)
 		return nil
@@ -908,7 +958,7 @@ func (c *Client) ActivateSession(ctx context.Context, s *Session) error {
 // See Part 4, 5.6.4
 func (c *Client) CloseSession(ctx context.Context) error {
 	stats.Client().Add("CloseSession", 1)
-	if err := c.closeSession(ctx, c.Session()); err != nil {
+	if err := c.closeSession(ctx, c.Session(), true); err != nil {
 		return err
 	}
 	c.setSession(nil)
@@ -916,11 +966,11 @@ func (c *Client) CloseSession(ctx context.Context) error {
 }
 
 // closeSession closes the given session.
-func (c *Client) closeSession(ctx context.Context, s *Session) error {
+func (c *Client) closeSession(ctx context.Context, s *Session, deleteSubscriptions bool) error {
 	if s == nil {
 		return nil
 	}
-	req := &ua.CloseSessionRequest{DeleteSubscriptions: true}
+	req := &ua.CloseSessionRequest{DeleteSubscriptions: deleteSubscriptions}
 	var res *ua.CloseSessionResponse
 	return c.Send(ctx, req, func(v interface{}) error {
 		return safeAssign(v, &res)
@@ -961,7 +1011,7 @@ func (c *Client) sendWithTimeout(ctx context.Context, req ua.Request, timeout ti
 	if s := c.Session(); s != nil {
 		authToken = s.resp.AuthenticationToken
 	}
-	return c.SecureChannel().SendRequestWithTimeout(ctx, req, authToken, timeout, h)
+	return sc.SendRequestWithTimeout(ctx, req, authToken, timeout, h)
 }
 
 // Node returns a node object which accesses its attributes

@@ -90,15 +90,16 @@ func (c *Client) SubscriptionIDs() []uint32 {
 
 // recreateSubscriptions creates new subscriptions
 // with the same parameters to replace the previous ones
-func (c *Client) recreateSubscription(ctx context.Context, id uint32) error {
+func (c *Client) recreateSubscription(ctx context.Context, id uint32) (uint32, error) {
 	c.subMux.Lock()
 	defer c.subMux.Unlock()
 
 	sub, ok := c.subs[id]
 	if !ok {
-		return ua.StatusBadSubscriptionIDInvalid
+		return 0, nil
 	}
-	return sub.recreate_NeedsSubMuxLock(ctx)
+	err := sub.recreate_NeedsSubMuxLock(ctx)
+	return sub.SubscriptionID, err
 }
 
 // transferSubscriptions ask the server to transfer the given subscriptions
@@ -178,7 +179,7 @@ func (c *Client) sendRepublishRequests(ctx context.Context, sub *Subscription, a
 
 		debug.Printf("RepublishRequest: req=%s", debug.ToJSON(req))
 		var res *ua.RepublishResponse
-		err := c.SecureChannel().SendRequest(ctx, req, c.Session().resp.AuthenticationToken, func(v interface{}) error {
+		err := sc.SendRequest(ctx, req, s.resp.AuthenticationToken, func(v interface{}) error {
 			return safeAssign(v, &res)
 		})
 		debug.Printf("RepublishResponse: res=%s err=%v", debug.ToJSON(res), err)
@@ -203,8 +204,26 @@ func (c *Client) sendRepublishRequests(ctx context.Context, sub *Subscription, a
 				debug.Printf("Republishing subscription %d failed: %v", req.SubscriptionID, status)
 				return status
 			}
+			if res.NotificationMessage == nil {
+				return ua.StatusBadUnexpectedError
+			}
+			if len(res.NotificationMessage.NotificationData) == 0 {
+				return nil
+			}
+			notifyCtx, cancel := context.WithTimeout(ctx, c.cfg.sechan.RequestTimeout)
+			c.notifySubscription(notifyCtx, sub, res.NotificationMessage)
+			err := notifyCtx.Err()
+			cancel()
+			if err != nil {
+				return err
+			}
+			c.subMux.Lock()
+			c.handleNotification_NeedsSubMuxLock(ctx, sub, &ua.PublishResponse{
+				SubscriptionID:      req.SubscriptionID,
+				NotificationMessage: res.NotificationMessage,
+			})
+			c.subMux.Unlock()
 		}
-		time.Sleep(time.Second)
 	}
 }
 
@@ -336,6 +355,7 @@ func (c *Client) resumeSubscriptions(ctx context.Context) {
 	select {
 	case <-ctx.Done():
 	case c.resumech <- struct{}{}:
+	default:
 	}
 }
 

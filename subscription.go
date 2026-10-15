@@ -24,6 +24,8 @@ const (
 
 const terminatedSubscriptionID uint32 = 0xC0CAC01B
 
+var errSubscriptionIDUnknown = errors.New("subscription creation response was not received")
+
 type Subscription struct {
 	SubscriptionID            uint32
 	RevisedPublishingInterval time.Duration
@@ -83,7 +85,9 @@ type PublishNotificationData struct {
 // from the client and the server.
 func (s *Subscription) Cancel(ctx context.Context) error {
 	stats.Subscription().Add("Cancel", 1)
-	s.c.forgetSubscription(ctx, s.SubscriptionID)
+	s.c.subMux.Lock()
+	defer s.c.subMux.Unlock()
+	s.c.forgetSubscription_NeedsSubMuxLock(ctx, s.SubscriptionID)
 	return s.delete(ctx)
 }
 
@@ -112,6 +116,11 @@ func (s *Subscription) delete(ctx context.Context) error {
 }
 
 func (s *Subscription) Monitor(ctx context.Context, ts ua.TimestampsToReturn, items ...*ua.MonitoredItemCreateRequest) (*ua.CreateMonitoredItemsResponse, error) {
+	s.c.subMux.RLock()
+	defer s.c.subMux.RUnlock()
+	if s.c.subs[s.SubscriptionID] != s {
+		return nil, ua.StatusBadSubscriptionIDInvalid
+	}
 	stats.Subscription().Add("Monitor", 1)
 	stats.Subscription().Add("MonitoredItems", int64(len(items)))
 
@@ -135,6 +144,9 @@ func (s *Subscription) Monitor(ctx context.Context, ts ua.TimestampsToReturn, it
 	s.itemsMu.Lock()
 	for i, item := range items {
 		result := res.Results[i]
+		if result.StatusCode != ua.StatusOK {
+			continue
+		}
 		s.items[result.MonitoredItemID] = &monitoredItem{
 			req: item,
 			res: result,
@@ -147,6 +159,8 @@ func (s *Subscription) Monitor(ctx context.Context, ts ua.TimestampsToReturn, it
 }
 
 func (s *Subscription) Unmonitor(ctx context.Context, monitoredItemIDs ...uint32) (*ua.DeleteMonitoredItemsResponse, error) {
+	s.c.subMux.RLock()
+	defer s.c.subMux.RUnlock()
 	stats.Subscription().Add("Unmonitor", 1)
 	stats.Subscription().Add("UnmonitoredItems", int64(len(monitoredItemIDs)))
 
@@ -174,6 +188,8 @@ func (s *Subscription) Unmonitor(ctx context.Context, monitoredItemIDs ...uint32
 }
 
 func (s *Subscription) ModifyMonitoredItems(ctx context.Context, ts ua.TimestampsToReturn, items ...*ua.MonitoredItemModifyRequest) (*ua.ModifyMonitoredItemsResponse, error) {
+	s.c.subMux.RLock()
+	defer s.c.subMux.RUnlock()
 	stats.Subscription().Add("ModifyMonitoredItems", 1)
 	stats.Subscription().Add("ModifiedMonitoredItems", int64(len(items)))
 
@@ -227,6 +243,8 @@ func (s *Subscription) ModifyMonitoredItems(ctx context.Context, ts ua.Timestamp
 }
 
 func (s *Subscription) SetMonitoringMode(ctx context.Context, monitoringMode ua.MonitoringMode, monitoredItemIDs ...uint32) (*ua.SetMonitoringModeResponse, error) {
+	s.c.subMux.RLock()
+	defer s.c.subMux.RUnlock()
 	stats.Subscription().Add("SetMonitoringMode", 1)
 	stats.Subscription().Add("SetMonitoringModeMonitoredItems", int64(len(monitoredItemIDs)))
 
@@ -264,6 +282,8 @@ func (s *Subscription) SetMonitoringMode(ctx context.Context, monitoringMode ua.
 // To add links from a triggering item to an item to report provide the server assigned ID(s) in the `add` argument.
 // To remove links from a triggering item to an item to report provide the server assigned ID(s) in the `remove` argument.
 func (s *Subscription) SetTriggering(ctx context.Context, triggeringItemID uint32, add, remove []uint32) (*ua.SetTriggeringResponse, error) {
+	s.c.subMux.RLock()
+	defer s.c.subMux.RUnlock()
 	stats.Subscription().Add("SetTriggering", 1)
 
 	// Part 4, 5.12.5.2 SetTriggering Service Parameters
@@ -372,13 +392,14 @@ func (s *Subscription) recreate_NeedsSubMuxLock(ctx context.Context) error {
 			SubscriptionIDs: []uint32{s.SubscriptionID},
 		}
 		var res *ua.DeleteSubscriptionsResponse
-		_ = s.c.Send(ctx, req, func(v interface{}) error {
+		err := s.c.Send(ctx, req, func(v interface{}) error {
 			return safeAssign(v, &res)
 		})
+		if err != nil && !errors.Is(err, ua.StatusBadSubscriptionIDInvalid) {
+			return err
+		}
 		dlog.Print("subscription deleted")
 	}
-	s.c.forgetSubscription_NeedsSubMuxLock(ctx, s.SubscriptionID)
-	dlog.Printf("subscription forgotton")
 
 	req := &ua.CreateSubscriptionRequest{
 		RequestedPublishingInterval: float64(params.Interval / time.Millisecond),
@@ -394,15 +415,23 @@ func (s *Subscription) recreate_NeedsSubMuxLock(ctx context.Context) error {
 	})
 	if err != nil {
 		dlog.Printf("failed to recreate subscription")
+		var status ua.StatusCode
+		if !errors.As(err, &status) || status == ua.StatusBadTimeout {
+			return errors.Join(errSubscriptionIDUnknown, err)
+		}
 		return err
 	}
 	// todo (unknownet): check if necessary
 	if status := res.ResponseHeader.ServiceResult; status != ua.StatusOK {
 		return status
 	}
+	if res.SubscriptionID == 0 || (res.SubscriptionID != s.SubscriptionID && s.c.subs[res.SubscriptionID] != nil) {
+		return ua.StatusBadSubscriptionIDInvalid
+	}
 	dlog.Printf("recreated as subscription %d", res.SubscriptionID)
 	dlog.SetPrefix(fmt.Sprintf("sub %d: recreate: ", res.SubscriptionID))
 
+	delete(s.c.subs, s.SubscriptionID)
 	s.SubscriptionID = res.SubscriptionID
 	s.RevisedPublishingInterval = time.Duration(res.RevisedPublishingInterval) * time.Millisecond
 	s.RevisedLifetimeCount = res.RevisedLifetimeCount
@@ -413,6 +442,7 @@ func (s *Subscription) recreate_NeedsSubMuxLock(ctx context.Context) error {
 	if err := s.c.registerSubscription_NeedsSubMuxLock(s); err != nil {
 		return err
 	}
+	s.c.updatePublishTimeout_NeedsSubMuxRLock()
 	dlog.Printf("subscription registered")
 
 	// Sort by timestamp to return
@@ -421,8 +451,8 @@ func (s *Subscription) recreate_NeedsSubMuxLock(ctx context.Context) error {
 	for _, mi := range s.items {
 		itemsByTimestamps[mi.ts] = append(itemsByTimestamps[mi.ts], mi.req)
 	}
-	s.items = make(map[uint32]*monitoredItem, len(s.items))
 	s.itemsMu.Unlock()
+	restored := make(map[uint32]*monitoredItem)
 
 	for ts, items := range itemsByTimestamps {
 		req := &ua.CreateMonitoredItemsRequest{
@@ -440,22 +470,30 @@ func (s *Subscription) recreate_NeedsSubMuxLock(ctx context.Context) error {
 			return err
 		}
 
-		for _, result := range res.Results {
-			if status := result.StatusCode; status != ua.StatusOK {
-				return status
-			}
+		if len(res.Results) != len(items) {
+			return ua.StatusBadUnexpectedError
 		}
 
-		s.itemsMu.Lock()
 		for i, item := range items {
-			s.items[res.Results[i].MonitoredItemID] = &monitoredItem{
+			result := res.Results[i]
+			switch result.StatusCode {
+			case ua.StatusOK:
+			case ua.StatusBadNodeIDUnknown, ua.StatusBadNodeIDInvalid, ua.StatusBadAttributeIDInvalid:
+				go s.notify(ctx, &PublishNotificationData{SubscriptionID: s.SubscriptionID, Error: result.StatusCode})
+				continue
+			default:
+				return result.StatusCode
+			}
+			restored[result.MonitoredItemID] = &monitoredItem{
 				req: item,
-				res: res.Results[i],
+				res: result,
 				ts:  ts,
 			}
 		}
-		s.itemsMu.Unlock()
 	}
+	s.itemsMu.Lock()
+	s.items = restored
+	s.itemsMu.Unlock()
 	dlog.Printf("subscription successfully recreated")
 
 	return nil
