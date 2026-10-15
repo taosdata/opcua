@@ -8,11 +8,11 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"log"
 	"math/rand"
 	"net"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/gopcua/opcua/errors"
@@ -20,6 +20,10 @@ import (
 	"github.com/gopcua/opcua/uacp"
 	"github.com/gopcua/opcua/uapolicy"
 	"github.com/gopcua/opcua/uasc"
+)
+
+const (
+	DefaultDialTimeout = 10 * time.Second
 )
 
 // DefaultClientConfig returns the default configuration for a client
@@ -53,26 +57,35 @@ func DefaultSessionConfig() *uasc.SessionConfig {
 
 // Config contains all config options.
 type Config struct {
-	dialer  *uacp.Dialer
-	sechan  *uasc.Config
-	session *uasc.SessionConfig
+	dialer    *uacp.Dialer
+	sechan    *uasc.Config
+	session   *uasc.SessionConfig
+	stateCh   chan<- ConnState
+	stateFunc func(ConnState)
 }
 
-// NewDialer creates a uacp.Dialer from the config options
-func NewDialer(cfg *Config) *uacp.Dialer {
-	if cfg.dialer == nil {
-		return &uacp.Dialer{}
+func DefaultDialer() *uacp.Dialer {
+	return &uacp.Dialer{
+		Dialer: &net.Dialer{
+			Timeout: DefaultDialTimeout,
+		},
+		ClientACK: uacp.DefaultClientACK,
 	}
-	return cfg.dialer
+}
+
+func newConfig() *Config {
+	return &Config{
+		dialer:  DefaultDialer(),
+		sechan:  DefaultClientConfig(),
+		session: DefaultSessionConfig(),
+	}
 }
 
 // ApplyConfig applies the config options to the default configuration.
 // todo(fs): Can we find a better name?
 func ApplyConfig(opts ...Option) (*Config, error) {
-	cfg := &Config{
-		sechan:  DefaultClientConfig(),
-		session: DefaultSessionConfig(),
-	}
+	cfg := newConfig()
+
 	var errs []error
 	for _, opt := range opts {
 		if err := opt(cfg); err != nil {
@@ -256,18 +269,60 @@ func loadPrivateKey(filename string) (*rsa.PrivateKey, error) {
 		return nil, errors.Errorf("Failed to load private key: %s", err)
 	}
 
-	derBytes := b
-	if strings.HasSuffix(filename, ".pem") {
-		block, _ := pem.Decode(b)
-		if block == nil || block.Type != "RSA PRIVATE KEY" {
-			return nil, errors.Errorf("Failed to decode PEM block with private key")
+	// Content-sniff: pem.Decode returns nil for non-PEM (raw DER) input,
+	// so dispatch on content, not file extension. A PKCS#8 key in a .key
+	// file (openssl genpkey default) loads correctly regardless of suffix.
+	if block, _ := pem.Decode(b); block != nil {
+		switch block.Type {
+		case "RSA PRIVATE KEY":
+			// PKCS#1 – the classic "openssl genrsa" output
+			pk, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+			if err != nil {
+				return nil, errors.Errorf("Failed to parse PKCS#1 private key: %s", err)
+			}
+			return pk, nil
+		case "PRIVATE KEY":
+			// PKCS#8 – the modern "openssl genpkey" default
+			return parsePKCS8RSAPrivateKey(block.Bytes)
+		default:
+			return nil, errors.Errorf("Failed to decode PEM block with private key: unsupported type %q", block.Type)
 		}
-		derBytes = block.Bytes
 	}
 
-	pk, err := x509.ParsePKCS1PrivateKey(derBytes)
+	return parseRSAPrivateKeyDER(b)
+}
+
+// parseRSAPrivateKeyDER tries to parse der as a PKCS#1 RSA key first and,
+// if that fails, as a PKCS#8 key. This is necessary for DER-encoded files
+// because there is no block-type header to identify the format.
+//
+// When both parses fail the errors are joined so a corrupt PKCS#1 key surfaces
+// both the PKCS#1 and PKCS#8 parse failures rather than only the (misleading)
+// PKCS#8 "asn1: structure error". A valid PKCS#8 RSA key returns cleanly from
+// parsePKCS8RSAPrivateKey without reaching the join.
+func parseRSAPrivateKeyDER(der []byte) (*rsa.PrivateKey, error) {
+	pk, errPKCS1 := x509.ParsePKCS1PrivateKey(der)
+	if errPKCS1 == nil {
+		return pk, nil
+	}
+	pk, err8 := parsePKCS8RSAPrivateKey(der)
+	if err8 != nil {
+		return nil, errors.Join(errors.Errorf("Failed to parse private key as PKCS#1: %s", errPKCS1), err8)
+	}
+	return pk, nil
+}
+
+// parsePKCS8RSAPrivateKey parses a PKCS#8-encoded RSA private key.
+// It returns an explicit error when the key is not RSA, because OPC UA
+// only supports RSA for channel security and user authentication.
+func parsePKCS8RSAPrivateKey(der []byte) (*rsa.PrivateKey, error) {
+	key, err := x509.ParsePKCS8PrivateKey(der)
 	if err != nil {
 		return nil, errors.Errorf("Failed to parse private key: %s", err)
+	}
+	pk, ok := key.(*rsa.PrivateKey)
+	if !ok {
+		return nil, errors.Errorf("Private key is not an RSA key")
 	}
 	return pk, nil
 }
@@ -276,8 +331,7 @@ func loadPrivateKey(filename string) (*rsa.PrivateKey, error) {
 // It also detects and sets the ApplicationURI from the URI within the certificate.
 func Certificate(cert []byte) Option {
 	return func(cfg *Config) error {
-		setCertificate(cert, cfg)
-		return nil
+		return setCertificate(cert, cfg)
 	}
 }
 
@@ -294,8 +348,7 @@ func CertificateFile(filename string) Option {
 		if err != nil {
 			return err
 		}
-		setCertificate(cert, cfg)
-		return nil
+		return setCertificate(cert, cfg)
 	}
 }
 
@@ -305,34 +358,50 @@ func loadCertificate(filename string) ([]byte, error) {
 		return nil, errors.Errorf("Failed to load certificate: %s", err)
 	}
 
-	if !strings.HasSuffix(filename, ".pem") {
-		return b, nil
+	// Content-sniff: dispatch on content, not file extension. A PEM-encoded
+	// certificate in a .crt file loads correctly; a raw DER certificate (any
+	// suffix) is returned as-is. pem.Decode returns nil for non-PEM input.
+	// For a PEM fullchain (leaf + intermediate/CA, the common fullchain.pem
+	// layout), concatenate every CERTIFICATE block so the whole chain is sent
+	// on the wire — matching the raw-DER path, which passes a concatenated
+	// chain through whole.
+	rest := b
+	var chain []byte
+	for {
+		block, r := pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		rest = r
+		if block.Type != "CERTIFICATE" {
+			return nil, errors.Errorf("Failed to decode PEM block with certificate: unsupported type %q", block.Type)
+		}
+		chain = append(chain, block.Bytes...)
+	}
+	if chain != nil {
+		return chain, nil
 	}
 
-	block, _ := pem.Decode(b)
-	if block == nil || block.Type != "CERTIFICATE" {
-		return nil, errors.Errorf("Failed to decode PEM block with certificate")
-	}
-	return block.Bytes, nil
+	return b, nil
 }
 
-func setCertificate(cert []byte, cfg *Config) {
+func setCertificate(cert []byte, cfg *Config) error {
 	cfg.sechan.Certificate = cert
 
 	// Extract the application URI from the certificate.
-	x509cert, err := x509.ParseCertificate(cert)
+	x509cert, err := uapolicy.ParseCertificate(cert)
 	if err != nil {
-		log.Fatalf("Failed to parse certificate: %s", err)
-		return
+		return fmt.Errorf("failed to parse certificate: %s", err)
 	}
 	if len(x509cert.URIs) == 0 {
-		return
+		return nil
 	}
 	appURI := x509cert.URIs[0].String()
 	if appURI == "" {
-		return
+		return nil
 	}
 	cfg.session.ClientDescription.ApplicationURI = appURI
+	return nil
 }
 
 // SecurityFromEndpoint sets the server-related security parameters from
@@ -363,7 +432,11 @@ func SecurityFromEndpoint(ep *ua.EndpointDescription, authType ua.UserTokenType)
 			}
 
 			setPolicyID(cfg.session.UserIdentityToken, t.PolicyID)
-			cfg.session.AuthPolicyURI = t.SecurityPolicyURI
+			if t.SecurityPolicyURI != "" {
+				cfg.session.AuthPolicyURI = t.SecurityPolicyURI
+			} else {
+				cfg.session.AuthPolicyURI = ep.SecurityPolicyURI
+			}
 			return nil
 		}
 
@@ -509,7 +582,6 @@ func RequestTimeout(t time.Duration) Option {
 // Dialer sets the uacp.Dialer to establish the connection to the server.
 func Dialer(d *uacp.Dialer) Option {
 	return func(cfg *Config) error {
-		initDialer(cfg)
 		cfg.dialer = d
 		return nil
 	}
@@ -519,7 +591,6 @@ func Dialer(d *uacp.Dialer) Option {
 // Defaults to DefaultDialTimeout. Set to zero for no timeout.
 func DialTimeout(d time.Duration) Option {
 	return func(cfg *Config) error {
-		initDialer(cfg)
 		cfg.dialer.Dialer.Timeout = d
 		return nil
 	}
@@ -528,7 +599,6 @@ func DialTimeout(d time.Duration) Option {
 // MaxMessageSize sets the maximum message size for the UACP handshake.
 func MaxMessageSize(n uint32) Option {
 	return func(cfg *Config) error {
-		initDialer(cfg)
 		cfg.dialer.ClientACK.MaxMessageSize = n
 		return nil
 	}
@@ -537,7 +607,6 @@ func MaxMessageSize(n uint32) Option {
 // MaxChunkCount sets the maximum chunk count for the UACP handshake.
 func MaxChunkCount(n uint32) Option {
 	return func(cfg *Config) error {
-		initDialer(cfg)
 		cfg.dialer.ClientACK.MaxChunkCount = n
 		return nil
 	}
@@ -546,7 +615,6 @@ func MaxChunkCount(n uint32) Option {
 // ReceiveBufferSize sets the receive buffer size for the UACP handshake.
 func ReceiveBufferSize(n uint32) Option {
 	return func(cfg *Config) error {
-		initDialer(cfg)
 		cfg.dialer.ClientACK.ReceiveBufSize = n
 		return nil
 	}
@@ -555,20 +623,26 @@ func ReceiveBufferSize(n uint32) Option {
 // SendBufferSize sets the send buffer size for the UACP handshake.
 func SendBufferSize(n uint32) Option {
 	return func(cfg *Config) error {
-		initDialer(cfg)
 		cfg.dialer.ClientACK.SendBufSize = n
 		return nil
 	}
 }
 
-func initDialer(cfg *Config) {
-	if cfg.dialer == nil {
-		cfg.dialer = &uacp.Dialer{}
+// StateChangedCh sets the channel for receiving client connection state changes.
+//
+// The caller must either consume the channel immediately or provide a buffer
+// to prevent blocking state changes in the client.
+func StateChangedCh(ch chan<- ConnState) Option {
+	return func(cfg *Config) error {
+		cfg.stateCh = ch
+		return nil
 	}
-	if cfg.dialer.Dialer == nil {
-		cfg.dialer.Dialer = &net.Dialer{}
-	}
-	if cfg.dialer.ClientACK == nil {
-		cfg.dialer.ClientACK = uacp.DefaultClientACK
+}
+
+// StateChangedFunc sets the function for receiving client connection state changes.
+func StateChangedFunc(f func(ConnState)) Option {
+	return func(cfg *Config) error {
+		cfg.stateFunc = f
+		return nil
 	}
 }

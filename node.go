@@ -19,7 +19,11 @@ type Node struct {
 	// ID is the node id of the node.
 	ID *ua.NodeID
 
-	c *Client
+	c ClientInterface
+}
+
+func NewNode(id *ua.NodeID, c ClientInterface) *Node {
+	return &Node{ID: id, c: c}
 }
 
 func (n *Node) String() string {
@@ -241,7 +245,7 @@ func (n *Node) TranslateBrowsePathsToNodeIDs(ctx context.Context, pathNames []*u
 	}
 
 	var nodeID *ua.NodeID
-	err := n.c.Send(ctx, &req, func(i interface{}) error {
+	err := n.c.Send(ctx, &req, func(i ua.Response) error {
 		if resp, ok := i.(*ua.TranslateBrowsePathsToNodeIDsResponse); ok {
 			if len(resp.Results) == 0 {
 				return ua.StatusBadUnexpectedError

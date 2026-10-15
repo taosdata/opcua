@@ -61,11 +61,15 @@ func (e *ExtensionObject) Decode(b []byte) (int, error) {
 	if length == 0 || length == 0xffffffff || buf.Error() != nil {
 		return buf.Pos(), buf.Error()
 	}
+
+	// The Body field contains the raw bytes for the value; there is no
+	// additional length prefix inside the body. See OPC UA Part 6, 5.2.2.
 	raw := buf.ReadN(int(length))
 	body := NewBuffer(raw)
 	if buf.Error() != nil {
 		return buf.Pos(), buf.Error()
 	}
+
 	if e.EncodingMask == ExtensionObjectXML {
 		e.Value = XMLElement(raw)
 		return buf.Pos(), body.Error()
@@ -74,6 +78,7 @@ func (e *ExtensionObject) Decode(b []byte) (int, error) {
 	typeID := e.TypeID.NodeID
 	e.Value = eotypes.New(typeID)
 	if e.Value == nil {
+		// keep the raw bytes so that callers can still inspect the body
 		e.Value = raw
 		debug.Printf("ua: unknown extension object %s", typeID)
 		return buf.Pos(), buf.Error()

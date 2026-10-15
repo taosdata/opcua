@@ -43,9 +43,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	ep := opcua.SelectEndpoint(endpoints, *policy, ua.MessageSecurityModeFromString(*mode))
-	if ep == nil {
-		log.Fatal("Failed to find suitable endpoint")
+	ep, err := opcua.SelectEndpoint(endpoints, *policy, ua.MessageSecurityModeFromString(*mode))
+	if err != nil {
+		log.Fatal(err)
 	}
 	ep.EndpointURL = *endpoint
 
@@ -96,6 +96,14 @@ func main() {
 	if err != nil || res.Results[0].StatusCode != ua.StatusOK {
 		log.Fatal(err)
 	}
+
+	// Uncomment the following to try modifying the subscription
+	//
+	// var params opcua.SubscriptionParameters
+	// params.Interval = time.Millisecond * 2000
+	// if _, err := sub.ModifySubscription(ctx, params); err != nil {
+	// 	log.Fatal(err)
+	// }
 
 	// read from subscription's notification channel until ctx is cancelled
 	for {

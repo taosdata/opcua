@@ -1,7 +1,14 @@
+// Package monitor provides an API for subscribing to OPC UA node value changes.
+//
+// The subscription owns ClientHandles: it ignores any value a caller sets and
+// assigns its own, which is how incoming notifications are matched back to
+// nodes. Callers may therefore share one ua.MonitoringParameters across many
+// Requests. See Part 4, 7.21.
 package monitor
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -17,6 +24,45 @@ var (
 	// ErrSlowConsumer is returned when a subscriber does not keep up with the incoming messages
 	ErrSlowConsumer = errors.New("slow consumer. messages may be dropped")
 )
+
+// ItemError represents a single monitored item that failed to be created.
+// AddMonitorItems returns an errors.Join of *ItemError when one or more items
+// could not be created on the server. Callers can inspect failures with the
+// standard errors helpers:
+//
+//	items, err := sub.AddMonitorItems(ctx, requests...)
+//	if err != nil {
+//	    // items contains the successfully created monitors (nil if all failed)
+//
+//	    // Check for a specific status code across all failures:
+//	    if errors.Is(err, ua.StatusBadNodeIDUnknown) { ... }
+//
+//	    // Inspect the first failing item:
+//	    var ie *monitor.ItemError
+//	    if errors.As(err, &ie) { _ = ie.NodeID; _ = ie.Status }
+//
+//	    // Iterate over all failures:
+//	    if u, ok := err.(interface{ Unwrap() []error }); ok {
+//	        for _, e := range u.Unwrap() {
+//	            var ie *monitor.ItemError
+//	            if errors.As(e, &ie) { /* ie.NodeID, ie.Status */ }
+//	        }
+//	    }
+//	}
+type ItemError struct {
+	NodeID *ua.NodeID
+	Status ua.StatusCode
+}
+
+func (e *ItemError) Error() string {
+	return fmt.Sprintf("%s: %s", e.NodeID, e.Status)
+}
+
+// Unwrap exposes the underlying status code so that errors.Is can match on
+// values such as ua.StatusBadNodeIDUnknown.
+func (e *ItemError) Unwrap() error {
+	return e.Status
+}
 
 // ErrHandler is a function that is called when there is an out of band issue with delivery
 type ErrHandler func(*opcua.Client, *Subscription, error)
@@ -56,12 +102,19 @@ func (m *Item) NodeID() *ua.NodeID {
 	return m.nodeID
 }
 
-// Request is a struct to manage a request to monitor a node
+// Request is a struct to manage a request to monitor a node or modify a monitored node
 type Request struct {
-	NodeID               *ua.NodeID
-	MonitoringMode       ua.MonitoringMode
+	NodeID         *ua.NodeID
+	MonitoringMode ua.MonitoringMode
+
+	// MonitoringParameters holds this node's monitoring settings. Any
+	// ClientHandle you set is ignored: Part 4, 7.21 scopes the handle to a
+	// single MonitoredItem, so the subscription assigns its own on a private,
+	// shallow copy and one instance may be shared across Requests.
+	// The copy leaves Filter and NodeID aliased with the caller; mutating
+	// either afterward is undefined, since Filter is replayed verbatim on
+	// reconnect.
 	MonitoringParameters *ua.MonitoringParameters
-	handle               uint32
 }
 
 // Subscription is an instance of an active subscription.
@@ -223,6 +276,12 @@ func (s *Subscription) pump(ctx context.Context, notifyCh chan<- *DataChangeMess
 	}
 }
 
+// Modify modifies the subscription settings
+func (s *Subscription) Modify(ctx context.Context, params *opcua.SubscriptionParameters) error {
+	_, err := s.sub.ModifySubscription(ctx, *params)
+	return err
+}
+
 // Unsubscribe removes the subscription interests and cleans up any resources
 func (s *Subscription) Unsubscribe(ctx context.Context) error {
 	// TODO: make idempotent
@@ -276,7 +335,8 @@ func (s *Subscription) AddNodeIDs(ctx context.Context, nodes ...*ua.NodeID) erro
 	return err
 }
 
-// AddMonitorItems adds nodes with monitoring parameters to the subscription
+// AddMonitorItems adds monitored nodes. Any ClientHandle set in a Request is
+// ignored; the subscription assigns its own. See Part 4, 7.21.
 func (s *Subscription) AddMonitorItems(ctx context.Context, nodes ...Request) ([]Item, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -288,21 +348,15 @@ func (s *Subscription) AddMonitorItems(ctx context.Context, nodes ...Request) ([
 	}
 
 	toAdd := make([]*ua.MonitoredItemCreateRequest, 0)
+	allocated := make([]uint32, len(nodes))
 
 	// Add handles and make requests
 	for i, node := range nodes {
 		handle := atomic.AddUint32(&s.monitor.nextClientHandle, 1)
 		s.handles[handle] = nodes[i].NodeID
-		nodes[i].handle = handle
+		allocated[i] = handle
 
-		request := opcua.NewMonitoredItemCreateRequestWithDefaults(node.NodeID, ua.AttributeIDValue, handle)
-		request.MonitoringMode = node.MonitoringMode
-
-		if node.MonitoringParameters != nil {
-			request.RequestedParameters = node.MonitoringParameters
-			request.RequestedParameters.ClientHandle = handle
-		}
-		toAdd = append(toAdd, request)
+		toAdd = append(toAdd, buildCreateRequest(node, handle))
 	}
 	resp, err := s.sub.Monitor(ctx, ua.TimestampsToReturnBoth, toAdd...)
 	if err != nil {
@@ -317,17 +371,31 @@ func (s *Subscription) AddMonitorItems(ctx context.Context, nodes ...Request) ([
 		return nil, errors.Errorf("monitor items response length mismatch")
 	}
 	var monitoredItems []Item
+	var failedItems []error
 	for i, res := range resp.Results {
 		if res.StatusCode != ua.StatusOK {
-			return nil, res.StatusCode
+			failedItems = append(failedItems, &ItemError{
+				NodeID: toAdd[i].ItemToMonitor.NodeID,
+				Status: res.StatusCode,
+			})
+			// Clean up the handle for the failed item
+			delete(s.handles, allocated[i])
+			continue
 		}
 		mn := Item{
 			id:     res.MonitoredItemID,
-			handle: nodes[i].handle,
+			handle: allocated[i],
 			nodeID: toAdd[i].ItemToMonitor.NodeID,
 		}
 		s.itemLookup[res.MonitoredItemID] = mn
 		monitoredItems = append(monitoredItems, mn)
+	}
+
+	if len(failedItems) > 0 {
+		// monitoredItems is nil when every item failed and non-nil when some
+		// items succeeded; either way the joined *ItemError values let
+		// callers use errors.Is / errors.As to inspect per-node failures.
+		return monitoredItems, errors.Join(failedItems...)
 	}
 
 	return monitoredItems, nil
@@ -397,6 +465,110 @@ func (s *Subscription) RemoveMonitorItems(ctx context.Context, items ...Item) er
 	for _, res := range resp.Results {
 		if res != ua.StatusOK {
 			return res
+		}
+	}
+
+	return nil
+}
+
+// ModifyMonitorItems modifies monitored nodes. Any ClientHandle set in a
+// Request is ignored; the subscription assigns its own. See Part 4, 7.21.
+func (s *Subscription) ModifyMonitorItems(ctx context.Context, nodes ...Request) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(nodes) == 0 {
+		return nil
+	}
+
+	items := make([]Item, 0, len(s.itemLookup))
+	for _, item := range s.itemLookup {
+		items = append(items, item)
+	}
+
+	toModify := buildModifyRequests(nodes, items)
+
+	resp, err := s.sub.ModifyMonitoredItems(ctx, ua.TimestampsToReturnBoth, toModify...)
+	if err != nil {
+		return err
+	}
+
+	if resp.ResponseHeader.ServiceResult != ua.StatusOK {
+		return resp.ResponseHeader.ServiceResult
+	}
+
+	if len(resp.Results) != len(toModify) {
+		return errors.Errorf("modify monitored items response length mismatch")
+	}
+
+	for _, res := range resp.Results {
+		if res.StatusCode != ua.StatusOK {
+			return res.StatusCode
+		}
+	}
+
+	return nil
+}
+
+// SetMonitoringModeForNodes sets the monitoring mode for nodes defined by their string representation
+func (s *Subscription) SetMonitoringModeForNodes(ctx context.Context, monitoringMode ua.MonitoringMode, nodes ...string) error {
+	nodeIDs, err := parseNodeSlice(nodes...)
+	if err != nil {
+		return err
+	}
+
+	return s.SetMonitoringModeForNodeIDs(ctx, monitoringMode, nodeIDs...)
+}
+
+// SetMonitoringModeForNodeIDs sets the monitoring mode for nodes
+func (s *Subscription) SetMonitoringModeForNodeIDs(ctx context.Context, monitoringMode ua.MonitoringMode, nodes ...*ua.NodeID) error {
+	if len(nodes) == 0 {
+		return nil
+	}
+
+	var toSet []Item
+	for _, node := range nodes {
+		for _, item := range s.itemLookup {
+			if item.nodeID.String() == node.String() {
+				toSet = append(toSet, item)
+				break
+			}
+		}
+	}
+
+	return s.SetMonitoringMode(ctx, monitoringMode, toSet...)
+}
+
+// SetMonitoringMode sets the monitoring mode for nodes
+func (s *Subscription) SetMonitoringMode(ctx context.Context, monitoringMode ua.MonitoringMode, items ...Item) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(items) == 0 {
+		return nil
+	}
+
+	toSet := make([]uint32, 0)
+	for _, item := range items {
+		toSet = append(toSet, item.id)
+	}
+
+	resp, err := s.sub.SetMonitoringMode(ctx, monitoringMode, toSet...)
+	if err != nil {
+		return err
+	}
+
+	if resp.ResponseHeader.ServiceResult != ua.StatusOK {
+		return resp.ResponseHeader.ServiceResult
+	}
+
+	if len(resp.Results) != len(toSet) {
+		return errors.Errorf("set monitoring mode response length mismatch")
+	}
+
+	for _, statusCode := range resp.Results {
+		if statusCode != ua.StatusOK {
+			return statusCode
 		}
 	}
 
