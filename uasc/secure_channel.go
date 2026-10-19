@@ -186,17 +186,13 @@ func (s *SecureChannel) dispatcher() {
 			return
 		default:
 			resp := s.receive(ctx)
+			openSecureChannelRequestID := s.openSecureChannelRequestID.Load()
+			if resp.Err != nil && resp.ReqID == 0 && openSecureChannelRequestID != 0 {
+				resp.ReqID = openSecureChannelRequestID
+			}
 
-			if shouldReportConnectionError(resp) {
-				select {
-				case <-s.closing:
-					return
-				default:
-					select {
-					case s.errCh <- resp.Err:
-					default:
-					}
-				}
+			if shouldReportConnectionError(resp, openSecureChannelRequestID) {
+				s.reportError(resp.Err)
 			}
 
 			if resp.Err == io.EOF {
@@ -207,12 +203,6 @@ func (s *SecureChannel) dispatcher() {
 				debug.Printf("uasc %d/%d: err: %v", s.c.ID(), resp.ReqID, resp.Err)
 			} else {
 				debug.Printf("uasc %d/%d: recv %T", s.c.ID(), resp.ReqID, resp.V)
-			}
-
-			// hack check connect error
-			openSecureChannelRequestID := s.openSecureChannelRequestID.Load()
-			if resp.Err != nil && resp.ReqID == 0 && openSecureChannelRequestID != 0 {
-				resp.ReqID = openSecureChannelRequestID
 			}
 
 			ch, ok := s.popHandler(resp.ReqID)
@@ -240,20 +230,44 @@ func (s *SecureChannel) dispatcher() {
 	}
 }
 
-func shouldReportConnectionError(resp *response) bool {
+// shouldReportConnectionError forwards connection and session faults to the
+// client monitor. OpenSecureChannel errors are handled by their callers;
+// scheduleRenewal forwards background renewal failures to the monitor.
+// Keep the status codes here aligned with the recovery actions in client.go.
+func shouldReportConnectionError(resp *response, openSecureChannelRequestID uint32) bool {
 	if resp.Err == nil {
+		return false
+	}
+	if openSecureChannelRequestID != 0 && resp.ReqID == openSecureChannelRequestID {
 		return false
 	}
 	if _, isServiceResponse := resp.V.(ua.Response); !isServiceResponse {
 		return true
 	}
-	switch resp.Err {
-	case ua.StatusBadSecureChannelIDInvalid, ua.StatusBadSecureChannelClosed,
+	for _, status := range []ua.StatusCode{
+		ua.StatusBadSecureChannelIDInvalid, ua.StatusBadSecureChannelClosed,
+		ua.StatusBadSecureChannelTokenUnknown,
 		ua.StatusBadSessionIDInvalid, ua.StatusBadSessionClosed,
-		ua.StatusBadSubscriptionIDInvalid, ua.StatusBadCertificateInvalid:
-		return true
+		ua.StatusBadSessionNotActivated,
+		ua.StatusBadSubscriptionIDInvalid, ua.StatusBadCertificateInvalid,
+		ua.StatusBadServerNotConnected, ua.StatusBadServerHalted, ua.StatusBadShutdown,
+	} {
+		if errors.Is(resp.Err, status) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *SecureChannel) reportError(err error) {
+	select {
+	case <-s.closing:
+		return
 	default:
-		return false
+	}
+	select {
+	case s.errCh <- err:
+	default:
 	}
 }
 
@@ -634,8 +648,9 @@ func (s *SecureChannel) scheduleRenewal(instance *channelInstance) {
 	case <-t.C:
 	}
 
-	// TODO: where should this error go?
-	_ = s.renew(instance)
+	if err := s.renew(instance); err != nil {
+		s.reportError(err)
+	}
 }
 
 func (s *SecureChannel) renew(instance *channelInstance) error {

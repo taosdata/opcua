@@ -22,21 +22,34 @@ import (
 
 func TestShouldReportConnectionError(t *testing.T) {
 	tests := []struct {
-		name string
-		resp *response
-		want bool
+		name                       string
+		resp                       *response
+		openSecureChannelRequestID uint32
+		want                       bool
 	}{
-		{"subscription limit", &response{Err: ua.StatusBadTooManySubscriptions, V: &ua.CreateSubscriptionResponse{}}, false},
-		{"invalid node", &response{Err: ua.StatusBadNodeIDUnknown, V: &ua.ReadResponse{}}, false},
-		{"session fault", &response{Err: ua.StatusBadSessionIDInvalid, V: &ua.CreateSubscriptionResponse{}}, true},
-		{"channel fault", &response{Err: ua.StatusBadSecureChannelIDInvalid, V: &ua.CreateSubscriptionResponse{}}, true},
-		{"transport error", &response{Err: io.EOF}, true},
-		{"decode error", &response{Err: ua.StatusBadDecodingError}, true},
-		{"success", &response{V: &ua.CreateSubscriptionResponse{}}, false},
+		{"subscription limit", &response{Err: ua.StatusBadTooManySubscriptions, V: &ua.CreateSubscriptionResponse{}}, 0, false},
+		{"invalid node", &response{Err: ua.StatusBadNodeIDUnknown, V: &ua.ReadResponse{}}, 0, false},
+		{"secure channel ID invalid", &response{Err: ua.StatusBadSecureChannelIDInvalid, V: &ua.ServiceFault{}}, 0, true},
+		{"secure channel closed", &response{Err: ua.StatusBadSecureChannelClosed, V: &ua.ServiceFault{}}, 0, true},
+		{"secure channel token unknown", &response{Err: ua.StatusBadSecureChannelTokenUnknown, V: &ua.ServiceFault{}}, 0, true},
+		{"session ID invalid", &response{Err: ua.StatusBadSessionIDInvalid, V: &ua.ServiceFault{}}, 0, true},
+		{"session closed", &response{Err: ua.StatusBadSessionClosed, V: &ua.ServiceFault{}}, 0, true},
+		{"session not activated", &response{Err: ua.StatusBadSessionNotActivated, V: &ua.ServiceFault{}}, 0, true},
+		{"subscription ID invalid", &response{Err: ua.StatusBadSubscriptionIDInvalid, V: &ua.ServiceFault{}}, 0, true},
+		{"certificate invalid", &response{Err: ua.StatusBadCertificateInvalid, V: &ua.ServiceFault{}}, 0, true},
+		{"server not connected", &response{Err: ua.StatusBadServerNotConnected, V: &ua.ServiceFault{}}, 0, true},
+		{"server halted", &response{Err: ua.StatusBadServerHalted, V: &ua.ServiceFault{}}, 0, true},
+		{"server shutdown", &response{Err: ua.StatusBadShutdown, V: &ua.ServiceFault{}}, 0, true},
+		{"wrapped session fault", &response{Err: fmt.Errorf("session: %w", ua.StatusBadSessionIDInvalid), V: &ua.ServiceFault{}}, 0, true},
+		{"open secure channel fault", &response{ReqID: 1, Err: ua.StatusBadSecurityChecksFailed, V: &ua.ServiceFault{}}, 1, false},
+		{"renew secure channel fault", &response{ReqID: 2, Err: ua.StatusBadNonceInvalid, V: &ua.ServiceFault{}}, 2, false},
+		{"transport error", &response{Err: io.EOF}, 0, true},
+		{"decode error", &response{Err: ua.StatusBadDecodingError}, 0, true},
+		{"success", &response{V: &ua.CreateSubscriptionResponse{}}, 0, false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := shouldReportConnectionError(test.resp); got != test.want {
+			if got := shouldReportConnectionError(test.resp, test.openSecureChannelRequestID); got != test.want {
 				t.Fatalf("shouldReportConnectionError() = %t, want %t", got, test.want)
 			}
 		})
