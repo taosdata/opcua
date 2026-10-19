@@ -17,7 +17,8 @@ func TestSubscriptionLimitKeepsConnection(t *testing.T) {
 	server := NewServer("subscription_limit_server.py")
 	defer server.Close()
 
-	client, err := opcua.NewClient(server.Endpoint, server.Opts...)
+	options := append(server.Opts, opcua.AutoReconnect(false))
+	client, err := opcua.NewClient(server.Endpoint, options...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,11 +29,10 @@ func TestSubscriptionLimitKeepsConnection(t *testing.T) {
 	}
 	defer client.Close(ctx)
 
-	first, err := client.Subscribe(ctx, nil, make(chan *opcua.PublishNotificationData, 1))
+	_, err = client.Subscribe(ctx, nil, make(chan *opcua.PublishNotificationData, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer first.Cancel(ctx)
 	secureChannel := client.SecureChannel()
 
 	_, err = client.Subscribe(ctx, nil, make(chan *opcua.PublishNotificationData, 1))
@@ -50,7 +50,26 @@ func TestSubscriptionLimitKeepsConnection(t *testing.T) {
 	if len(response.Results) != 1 || response.Results[0].Status != ua.StatusOK {
 		t.Fatalf("Read() after rejected subscription returned %v", response.Results)
 	}
-	if client.State() != opcua.Connected || client.SecureChannel() != secureChannel {
-		t.Fatalf("connection changed after rejected subscription: state=%s", client.State())
+
+	checkConnection := func() {
+		if client.State() != opcua.Connected || client.SecureChannel() != secureChannel {
+			t.Fatalf("connection changed after rejected subscription: state=%s", client.State())
+		}
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			checkConnection()
+		case <-deadline.C:
+			checkConnection()
+			if err := client.CloseSession(ctx); err != nil {
+				t.Fatalf("CloseSession() after rejected subscription: %v", err)
+			}
+			return
+		}
 	}
 }

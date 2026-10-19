@@ -29,6 +29,7 @@ func TestShouldReportConnectionError(t *testing.T) {
 		want                       bool
 	}{
 		{"subscription limit", &response{Err: ua.StatusBadTooManySubscriptions, V: &ua.CreateSubscriptionResponse{}}, 0, false},
+		{"subscription limit service fault", &response{Err: ua.StatusBadTooManySubscriptions, V: &ua.ServiceFault{}}, 0, false},
 		{"invalid node", &response{Err: ua.StatusBadNodeIDUnknown, V: &ua.ReadResponse{}}, 0, false},
 		{"secure channel ID invalid", &response{Err: ua.StatusBadSecureChannelIDInvalid, V: &ua.ServiceFault{}}, 0, true},
 		{"secure channel closed", &response{Err: ua.StatusBadSecureChannelClosed, V: &ua.ServiceFault{}}, 0, true},
