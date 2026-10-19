@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math"
 	"strings"
 	"testing"
@@ -18,6 +19,29 @@ import (
 	"github.com/gopcua/opcua/uatest"
 	"github.com/pascaldekloe/goe/verify"
 )
+
+func TestShouldReportConnectionError(t *testing.T) {
+	tests := []struct {
+		name string
+		resp *response
+		want bool
+	}{
+		{"subscription limit", &response{Err: ua.StatusBadTooManySubscriptions, V: &ua.CreateSubscriptionResponse{}}, false},
+		{"invalid node", &response{Err: ua.StatusBadNodeIDUnknown, V: &ua.ReadResponse{}}, false},
+		{"session fault", &response{Err: ua.StatusBadSessionIDInvalid, V: &ua.CreateSubscriptionResponse{}}, true},
+		{"channel fault", &response{Err: ua.StatusBadSecureChannelIDInvalid, V: &ua.CreateSubscriptionResponse{}}, true},
+		{"transport error", &response{Err: io.EOF}, true},
+		{"decode error", &response{Err: ua.StatusBadDecodingError}, true},
+		{"success", &response{V: &ua.CreateSubscriptionResponse{}}, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := shouldReportConnectionError(test.resp); got != test.want {
+				t.Fatalf("shouldReportConnectionError() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
 
 func TestNewRequestMessage(t *testing.T) {
 	fixedTime := func() time.Time { return time.Date(2019, 1, 1, 12, 13, 14, 0, time.UTC) }

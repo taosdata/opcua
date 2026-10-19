@@ -187,7 +187,7 @@ func (s *SecureChannel) dispatcher() {
 		default:
 			resp := s.receive(ctx)
 
-			if resp.Err != nil {
+			if shouldReportConnectionError(resp) {
 				select {
 				case <-s.closing:
 					return
@@ -237,6 +237,23 @@ func (s *SecureChannel) dispatcher() {
 
 			s.rcvLocker.waitIfLock()
 		}
+	}
+}
+
+func shouldReportConnectionError(resp *response) bool {
+	if resp.Err == nil {
+		return false
+	}
+	if _, isServiceResponse := resp.V.(ua.Response); !isServiceResponse {
+		return true
+	}
+	switch resp.Err {
+	case ua.StatusBadSecureChannelIDInvalid, ua.StatusBadSecureChannelClosed,
+		ua.StatusBadSessionIDInvalid, ua.StatusBadSessionClosed,
+		ua.StatusBadSubscriptionIDInvalid, ua.StatusBadCertificateInvalid:
+		return true
+	default:
+		return false
 	}
 }
 
