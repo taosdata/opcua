@@ -232,7 +232,7 @@ func (s *SecureChannel) dispatcher() {
 
 // shouldReportConnectionError forwards connection and session faults to the
 // client monitor. OpenSecureChannel errors are handled by their callers;
-// scheduleRenewal forwards background renewal failures to the monitor.
+// both scheduled and explicit renewals forward failures to the monitor.
 // Keep the status codes here aligned with the recovery actions in client.go.
 func shouldReportConnectionError(resp *response, openSecureChannelRequestID uint32) bool {
 	if resp.Err == nil {
@@ -648,9 +648,15 @@ func (s *SecureChannel) scheduleRenewal(instance *channelInstance) {
 	case <-t.C:
 	}
 
-	if err := s.renew(instance); err != nil {
+	s.renewAndReport(instance)
+}
+
+func (s *SecureChannel) renewAndReport(instance *channelInstance) error {
+	err := s.renew(instance)
+	if err != nil {
 		s.reportError(err)
 	}
+	return err
 }
 
 func (s *SecureChannel) renew(instance *channelInstance) error {
@@ -761,13 +767,14 @@ func (s *SecureChannel) popHandler(reqID uint32) (chan *response, bool) {
 	return ch, ok
 }
 
+// Renew refreshes the secure channel token and reports failures to the client monitor.
 func (s *SecureChannel) Renew(ctx context.Context) error {
 	instance, err := s.getActiveChannelInstance()
 	if err != nil {
 		return err
 	}
 
-	return s.renew(instance)
+	return s.renewAndReport(instance)
 }
 
 // SendRequest sends the service request and calls h with the response.

@@ -2,6 +2,7 @@ package uasc
 
 import (
 	"bytes"
+	"context"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
@@ -51,6 +52,46 @@ func TestShouldReportConnectionError(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if got := shouldReportConnectionError(test.resp, test.openSecureChannelRequestID); got != test.want {
 				t.Fatalf("shouldReportConnectionError() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRenewalReportsError(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		background bool
+	}{
+		{"scheduled", true},
+		{"explicit", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			errCh := make(chan error, 1)
+			channel := &SecureChannel{
+				c:         &uacp.Conn{},
+				cfg:       &Config{SecurityMode: ua.MessageSecurityModeSign, RemoteCertificate: []byte("invalid")},
+				closing:   make(chan struct{}),
+				errCh:     errCh,
+				reqLocker: newConditionLocker(),
+				rcvLocker: newConditionLocker(),
+			}
+			channel.startDispatcher.Do(func() {})
+			instance := newChannelInstance(channel)
+			channel.activeInstance = instance
+
+			if test.background {
+				channel.scheduleRenewal(instance)
+			} else if err := channel.Renew(context.Background()); err == nil {
+				t.Fatal("Renew() succeeded with an invalid server certificate")
+			}
+
+			select {
+			case err := <-errCh:
+				if err == nil {
+					t.Fatal("renewal reported a nil error")
+				}
+			default:
+				t.Fatal("renewal error was not reported to the client monitor")
 			}
 		})
 	}
