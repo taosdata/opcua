@@ -4,6 +4,7 @@
 package uatest
 
 import (
+	"bytes"
 	"context"
 	"testing"
 
@@ -43,6 +44,13 @@ func TestReadUnknowNodeID(t *testing.T) {
 
 	if got, want := resp.Results[0].Status, ua.StatusBadDataTypeIDUnknown; got != want {
 		t.Errorf("got status %v want %v for a node with an unknown type", got, want)
+	}
+	if value := resp.Results[0].Value; value == nil {
+		t.Fatal("missing value for a node with an unknown type")
+	} else if object, ok := value.Value().(*ua.ExtensionObject); !ok {
+		t.Fatalf("got value type %T, want *ua.ExtensionObject", value.Value())
+	} else if raw, ok := object.Value.([]byte); !ok || !bytes.Equal(raw, make([]byte, 8)) {
+		t.Fatalf("got raw extension object body %v, want eight zero bytes", object.Value)
 	}
 
 	// check that the connection is still usable by reading another node.
