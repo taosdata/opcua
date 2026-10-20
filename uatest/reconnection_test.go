@@ -99,9 +99,14 @@ func TestAutoReconnection(t *testing.T) {
 
 	for _, tt := range tests {
 		ok := t.Run(tt.name, func(t *testing.T) {
+			if c.State() != opcua.Connected {
+				t.Fatalf("connection is not ready before failure simulation: %s", c.State())
+			}
 
-			if msg := <-ch; msg.Error != nil {
-				t.Fatalf("No error expected for first value: %s", msg.Error)
+			for len(ch) > 0 {
+				if msg := <-ch; msg.Error != nil {
+					t.Fatalf("No error expected before failure simulation: %s", msg.Error)
+				}
 			}
 
 			downC := make(chan struct{}, 1)
