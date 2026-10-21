@@ -2,10 +2,12 @@ package uasc
 
 import (
 	"bytes"
+	"context"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math"
 	"strings"
 	"testing"
@@ -18,6 +20,83 @@ import (
 	"github.com/gopcua/opcua/uatest"
 	"github.com/pascaldekloe/goe/verify"
 )
+
+func TestShouldReportConnectionError(t *testing.T) {
+	tests := []struct {
+		name                       string
+		resp                       *response
+		openSecureChannelRequestID uint32
+		want                       bool
+	}{
+		{"subscription limit", &response{Err: ua.StatusBadTooManySubscriptions, V: &ua.CreateSubscriptionResponse{}}, 0, false},
+		{"subscription limit service fault", &response{Err: ua.StatusBadTooManySubscriptions, V: &ua.ServiceFault{}}, 0, false},
+		{"invalid node", &response{Err: ua.StatusBadNodeIDUnknown, V: &ua.ReadResponse{}}, 0, false},
+		{"secure channel ID invalid", &response{Err: ua.StatusBadSecureChannelIDInvalid, V: &ua.ServiceFault{}}, 0, true},
+		{"secure channel closed", &response{Err: ua.StatusBadSecureChannelClosed, V: &ua.ServiceFault{}}, 0, true},
+		{"secure channel token unknown", &response{Err: ua.StatusBadSecureChannelTokenUnknown, V: &ua.ServiceFault{}}, 0, true},
+		{"session ID invalid", &response{Err: ua.StatusBadSessionIDInvalid, V: &ua.ServiceFault{}}, 0, true},
+		{"session closed", &response{Err: ua.StatusBadSessionClosed, V: &ua.ServiceFault{}}, 0, true},
+		{"session not activated", &response{Err: ua.StatusBadSessionNotActivated, V: &ua.ServiceFault{}}, 0, true},
+		{"subscription ID invalid", &response{Err: ua.StatusBadSubscriptionIDInvalid, V: &ua.ServiceFault{}}, 0, true},
+		{"certificate invalid", &response{Err: ua.StatusBadCertificateInvalid, V: &ua.ServiceFault{}}, 0, true},
+		{"server not connected", &response{Err: ua.StatusBadServerNotConnected, V: &ua.ServiceFault{}}, 0, true},
+		{"server halted", &response{Err: ua.StatusBadServerHalted, V: &ua.ServiceFault{}}, 0, true},
+		{"server shutdown", &response{Err: ua.StatusBadShutdown, V: &ua.ServiceFault{}}, 0, true},
+		{"wrapped session fault", &response{Err: fmt.Errorf("session: %w", ua.StatusBadSessionIDInvalid), V: &ua.ServiceFault{}}, 0, true},
+		{"open secure channel fault", &response{ReqID: 1, Err: ua.StatusBadSecurityChecksFailed, V: &ua.ServiceFault{}}, 1, false},
+		{"renew secure channel fault", &response{ReqID: 2, Err: ua.StatusBadNonceInvalid, V: &ua.ServiceFault{}}, 2, false},
+		{"transport error", &response{Err: io.EOF}, 0, true},
+		{"decode error", &response{Err: ua.StatusBadDecodingError}, 0, true},
+		{"success", &response{V: &ua.CreateSubscriptionResponse{}}, 0, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := shouldReportConnectionError(test.resp, test.openSecureChannelRequestID); got != test.want {
+				t.Fatalf("shouldReportConnectionError() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRenewalReportsError(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		background bool
+	}{
+		{"scheduled", true},
+		{"explicit", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			errCh := make(chan error, 1)
+			channel := &SecureChannel{
+				c:         &uacp.Conn{},
+				cfg:       &Config{SecurityMode: ua.MessageSecurityModeSign, RemoteCertificate: []byte("invalid")},
+				closing:   make(chan struct{}),
+				errCh:     errCh,
+				reqLocker: newConditionLocker(),
+				rcvLocker: newConditionLocker(),
+			}
+			channel.startDispatcher.Do(func() {})
+			instance := newChannelInstance(channel)
+			channel.activeInstance = instance
+
+			if test.background {
+				channel.scheduleRenewal(instance)
+			} else if err := channel.Renew(context.Background()); err == nil {
+				t.Fatal("Renew() succeeded with an invalid server certificate")
+			}
+
+			select {
+			case err := <-errCh:
+				if err == nil {
+					t.Fatal("renewal reported a nil error")
+				}
+			default:
+				t.Fatal("renewal error was not reported to the client monitor")
+			}
+		})
+	}
+}
 
 func TestNewRequestMessage(t *testing.T) {
 	fixedTime := func() time.Time { return time.Date(2019, 1, 1, 12, 13, 14, 0, time.UTC) }
