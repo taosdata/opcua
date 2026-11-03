@@ -14,6 +14,7 @@ release = asyncio.Event()
 original_subscription = InternalSession.create_subscription
 original_items = InternalSession.create_monitored_items
 original_activate = InternalSession.activate_session
+original_close = InternalSession.close_session
 original_republish = InternalSubscription.republish
 original_publish_response = UaProcessor.forward_publish_response
 rejected_session = None
@@ -59,12 +60,18 @@ def republish(subscription, sequence):
 
 def activate_session(session, *args, **kwargs):
     global fault, rejected_session
-    if fault == "reject_activate":
+    if fault in ("reject_activate", "reject_activate_close"):
         rejected_session = session
-        fault = ""
+        fault = "reject_close_channel" if fault == "reject_activate_close" else ""
     if rejected_session is session:
         raise UaStatusCodeError(ua.StatusCodes.BadIdentityTokenInvalid)
     return original_activate(session, *args, **kwargs)
+
+
+async def close_session(session, *args, **kwargs):
+    if fault == "reject_close_channel" and rejected_session is session:
+        raise UaStatusCodeError(ua.StatusCodes.BadSecureChannelIdInvalid)
+    return await original_close(session, *args, **kwargs)
 
 
 async def create_subscription(session, *args, **kwargs):
@@ -106,6 +113,7 @@ async def create_items(session, *args, **kwargs):
 InternalSession.create_subscription = create_subscription
 InternalSession.create_monitored_items = create_items
 InternalSession.activate_session = activate_session
+InternalSession.close_session = close_session
 InternalSubscription.republish = republish
 UaProcessor.forward_publish_response = publish_response
 
@@ -146,9 +154,11 @@ async def main():
                     release.clear()
                     server, variables = await start_server(endpoint, command == "restart_missing")
                     print("RESTARTED", flush=True)
-                elif command in ("cut", "cut_reject_activate", "cut_republish"):
+                elif command in ("cut", "cut_reject_activate", "cut_reject_activate_close", "cut_republish"):
                     if command == "cut_reject_activate":
                         fault = "reject_activate"
+                    if command == "cut_reject_activate_close":
+                        fault = "reject_activate_close"
                     if command == "cut_republish":
                         fault = "republish_notification"
                     for protocol in list(server.bserver.clients):

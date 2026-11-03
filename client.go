@@ -467,7 +467,11 @@ func (c *Client) monitor(ctx context.Context) {
 						c.setState(Reconnecting)
 						// create a new session to replace the previous one
 
-						if err := c.closeSession(ctx, c.Session(), discardSession); err != nil && !errors.Is(err, ua.StatusBadSessionIDInvalid) && !errors.Is(err, ua.StatusBadSessionClosed) {
+						// A session that is not bound to this channel cannot be closed through it.
+						if err := c.closeSession(ctx, c.Session(), discardSession); err != nil &&
+							!errors.Is(err, ua.StatusBadSessionIDInvalid) &&
+							!errors.Is(err, ua.StatusBadSessionClosed) &&
+							!errors.Is(err, ua.StatusBadSecureChannelIDInvalid) {
 							action = createSecureChannel
 							continue
 						}

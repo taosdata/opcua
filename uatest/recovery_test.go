@@ -137,7 +137,7 @@ func recoveryValue(t *testing.T, ctx context.Context, notifications <-chan *opcu
 }
 
 func TestSubscriptionRecovery(t *testing.T) {
-	for _, fault := range []string{"restart", "cut", "cut_reject_activate", "restart_missing", "restart_reject_subscription", "restart_drop_subscription_response", "restart_drop_subscription_disconnect", "restart_reject_items", "restart_reject_item"} {
+	for _, fault := range []string{"restart", "cut", "cut_reject_activate", "cut_reject_activate_close", "restart_missing", "restart_reject_subscription", "restart_drop_subscription_response", "restart_drop_subscription_disconnect", "restart_reject_items", "restart_reject_item"} {
 		t.Run(fault, func(t *testing.T) {
 			ctx, client, server := startRecoveryClient(t)
 			notifications := make(chan *opcua.PublishNotificationData, 128)
@@ -151,7 +151,7 @@ func TestSubscriptionRecovery(t *testing.T) {
 			session := client.Session()
 			for round := 0; round < 2; round++ {
 				acknowledgement := "RESTARTED"
-				if fault == "cut" || fault == "cut_reject_activate" {
+				if fault == "cut" || fault == "cut_reject_activate" || fault == "cut_reject_activate_close" {
 					acknowledgement = "CUT"
 				}
 				server.command(t, fault, acknowledgement)
@@ -163,7 +163,11 @@ func TestSubscriptionRecovery(t *testing.T) {
 				if fault == "cut" && client.Session() != session {
 					t.Fatal("transport reconnect replaced the valid session")
 				}
-				server.command(t, "stats", "SESSIONS=1")
+				expectedSessions := 1
+				if fault == "cut_reject_activate_close" {
+					expectedSessions = round + 2
+				}
+				server.command(t, "stats", fmt.Sprintf("SESSIONS=%d", expectedSessions))
 				server.command(t, "subscriptions", "SUBSCRIPTIONS=1")
 			}
 		})
