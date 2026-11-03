@@ -284,7 +284,10 @@ func TestSubscriptionRecoveryPermanentItemNotification(t *testing.T) {
 	recoveryMonitor(t, ctx, subscription, 1001, 1)
 	recoveryMonitor(t, ctx, subscription, 1002, 2)
 	recoveryValue(t, ctx, notifications, 1, time.Time{})
-	notifications <- &opcua.PublishNotificationData{}
+	select {
+	case notifications <- &opcua.PublishNotificationData{}:
+	default:
+	}
 
 	baseline := runtime.NumGoroutine()
 	server.command(t, "restart_missing_reject_item_always", "RESTARTED")
