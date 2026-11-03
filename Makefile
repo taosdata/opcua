@@ -20,6 +20,7 @@ test-race:
 
 install-py-opcua:
 	pip3 install opcua
+	pip3 install asyncua==2.1.0
 
 gen:
 	go install golang.org/x/tools/cmd/stringer@latest

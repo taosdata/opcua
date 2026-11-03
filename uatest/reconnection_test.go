@@ -103,6 +103,14 @@ func TestAutoReconnection(t *testing.T) {
 				t.Fatalf("connection is not ready before failure simulation: %s", c.State())
 			}
 
+			select {
+			case msg := <-ch:
+				if msg.Error != nil {
+					t.Fatalf("No error expected for first value: %s", msg.Error)
+				}
+			case <-time.After(reconnectionTimeout):
+				t.Fatal("subscription stopped before the next fault")
+			}
 			for len(ch) > 0 {
 				if msg := <-ch; msg.Error != nil {
 					t.Fatalf("No error expected before failure simulation: %s", msg.Error)
@@ -153,6 +161,21 @@ func TestAutoReconnection(t *testing.T) {
 			case msg := <-ch:
 				if err := msg.Error; err != nil {
 					t.Fatal(err)
+				}
+			}
+			previous := time.Now()
+			for updates := 0; updates < 2; {
+				select {
+				case <-rTimeout.C:
+					t.Fatal("subscription did not continue with fresh source timestamps after recovery")
+				case msg := <-ch:
+					if msg.Error != nil {
+						t.Fatal(msg.Error)
+					}
+					if msg.SourceTimestamp.After(previous) {
+						previous = msg.SourceTimestamp
+						updates++
+					}
 				}
 			}
 		})

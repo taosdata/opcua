@@ -31,7 +31,7 @@ func TestReadUnknowNodeID(t *testing.T) {
 	defer c.Close(ctx)
 
 	// read node with unknown extension object
-	// This should be OK
+	// This should preserve the raw value without disconnecting.
 	nodeWithUnknownType := ua.NewStringNodeID(2, "IntValZero")
 	resp, err := c.Read(ctx, &ua.ReadRequest{
 		NodesToRead: []*ua.ReadValueID{

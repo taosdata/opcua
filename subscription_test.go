@@ -1,7 +1,9 @@
 package opcua
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/gopcua/opcua/ua"
 )
@@ -103,4 +105,24 @@ func BenchmarkUnmonitorItems(b *testing.B) {
 
 		b.Log("src", len(src)) // ensure src and dst are not GC'ed
 	})
+}
+
+func TestSubscriptionNotifyWithTimeout(t *testing.T) {
+	cfg, err := ApplyConfig(RequestTimeout(20 * time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifications := make(chan *PublishNotificationData, 1)
+	notifications <- &PublishNotificationData{}
+	subscription := &Subscription{c: &Client{cfg: cfg}, Notifs: notifications}
+	done := make(chan struct{})
+	go func() {
+		subscription.notifyWithTimeout(context.Background(), &PublishNotificationData{Error: ua.StatusBadNodeIDUnknown})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("notification remained blocked after RequestTimeout")
+	}
 }

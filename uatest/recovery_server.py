@@ -1,0 +1,215 @@
+import asyncio
+import logging
+import sys
+
+from asyncua import Server, ua
+from asyncua.server.internal_session import InternalSession
+from asyncua.server.internal_subscription import InternalSubscription
+from asyncua.server.uaprocessor import UaProcessor
+from asyncua.ua.uaerrors import UaStatusCodeError
+
+logging.basicConfig(level=logging.ERROR)
+fault = ""
+release = asyncio.Event()
+original_subscription = InternalSession.create_subscription
+original_items = InternalSession.create_monitored_items
+original_create_session = InternalSession.create_session
+original_activate = InternalSession.activate_session
+original_close = InternalSession.close_session
+original_republish = InternalSubscription.republish
+original_publish_response = UaProcessor.forward_publish_response
+rejected_session = None
+session_creations = 0
+item_rejections = 0
+pending_publish = set()
+
+
+async def publish_response(processor, result, request):
+    global fault
+    if fault in ("hold_publish", "hold_publish_error"):
+        fail = fault == "hold_publish_error"
+        fault = ""
+        print("PUBLISH_HELD", flush=True)
+        async def finish_publish():
+            await release.wait()
+            if fail:
+                response = ua.PublishResponse()
+                response.ResponseHeader.ServiceResult = ua.StatusCode(ua.StatusCodes.BadNoSubscription)
+                processor.send_response(request.requesthdr.RequestHandle, request.seqhdr, response)
+            else:
+                await original_publish_response(processor, result, request)
+        task = asyncio.create_task(finish_publish())
+        pending_publish.add(task)
+        task.add_done_callback(pending_publish.discard)
+        return
+    await original_publish_response(processor, result, request)
+
+
+def republish(subscription, sequence):
+    global fault
+    if fault == "republish_notification":
+        fault = ""
+        message = ua.NotificationMessage()
+        message.SequenceNumber = sequence
+        data = ua.DataChangeNotification()
+        item = ua.MonitoredItemNotification()
+        item.ClientHandle = 1
+        item.Value = ua.DataValue(ua.Variant(123))
+        data.MonitoredItems = [item]
+        message.NotificationData = [data]
+        return message
+    return original_republish(subscription, sequence)
+
+
+def activate_session(session, *args, **kwargs):
+    global fault, rejected_session
+    if fault in ("reject_activate", "reject_activate_close"):
+        rejected_session = session
+        fault = "reject_close_channel" if fault == "reject_activate_close" else ""
+    if rejected_session is session:
+        raise UaStatusCodeError(ua.StatusCodes.BadIdentityTokenInvalid)
+    return original_activate(session, *args, **kwargs)
+
+
+async def close_session(session, *args, **kwargs):
+    if fault == "reject_close_channel" and rejected_session is session:
+        raise UaStatusCodeError(ua.StatusCodes.BadSecureChannelIdInvalid)
+    return await original_close(session, *args, **kwargs)
+
+
+async def create_session(session, *args, **kwargs):
+    global fault, session_creations
+    session_creations += 1
+    if fault == "reject_items_unexpected":
+        fault = ""
+    return await original_create_session(session, *args, **kwargs)
+
+
+async def create_subscription(session, *args, **kwargs):
+    global fault
+    if fault == "reject_subscription":
+        fault = ""
+        raise UaStatusCodeError(ua.StatusCodes.BadTooManySubscriptions)
+    if fault in ("drop_subscription_response", "drop_subscription_disconnect"):
+        disconnect = fault == "drop_subscription_disconnect"
+        fault = ""
+        result = await original_subscription(session, *args, **kwargs)
+        if disconnect:
+            for protocol in list(current_server.bserver.clients):
+                protocol.transport.close()
+        await asyncio.sleep(1.5)
+        return result
+    return await original_subscription(session, *args, **kwargs)
+
+
+async def create_items(session, *args, **kwargs):
+    global fault, item_rejections
+    parameters = args[0]
+    reject_persistently = fault == "reject_items_always" and any(item.ItemToMonitor.NodeId.Identifier == 1002 for item in parameters.ItemsToCreate)
+    if fault == "reject_items" or reject_persistently:
+        if fault == "reject_items":
+            fault = ""
+        raise UaStatusCodeError(ua.StatusCodes.BadTooManyOperations)
+    if fault == "reject_items_unexpected":
+        raise UaStatusCodeError(ua.StatusCodes.BadUnexpectedError)
+    if fault == "hold_items":
+        fault = ""
+        print("RESTORING", flush=True)
+        await release.wait()
+    result = await original_items(session, *args, **kwargs)
+    if fault == "reject_item":
+        fault = ""
+        result[0].StatusCode = ua.StatusCode(ua.StatusCodes.BadOutOfMemory)
+    if fault == "missing_reject_item_always":
+        item_rejections += 1
+        for item, item_result in zip(parameters.ItemsToCreate, result):
+            if item.ItemToMonitor.NodeId.Identifier != 1002:
+                item_result.StatusCode = ua.StatusCode(ua.StatusCodes.BadOutOfMemory)
+    return result
+
+
+InternalSession.create_subscription = create_subscription
+InternalSession.create_monitored_items = create_items
+InternalSession.create_session = create_session
+InternalSession.activate_session = activate_session
+InternalSession.close_session = close_session
+InternalSubscription.republish = republish
+UaProcessor.forward_publish_response = publish_response
+
+
+async def start_server(endpoint, missing=False):
+    global current_server
+    server = Server()
+    await server.init()
+    server.set_endpoint(endpoint)
+    await server.register_namespace("urn:taosdata:recovery-test")
+    variables = []
+    for node_id in (1001, 1002, 1003):
+        if missing and node_id == 1002:
+            continue
+        variables.append(await server.nodes.objects.add_variable(ua.NodeId(node_id, 2), f"Counter{node_id}", 0))
+    await server.start()
+    current_server = server
+    return server, variables
+
+
+async def main():
+    global fault
+    endpoint = sys.argv[1]
+    server, variables = await start_server(endpoint)
+    print("READY", flush=True)
+    command_task = asyncio.create_task(asyncio.to_thread(sys.stdin.readline))
+    counter = 0
+    try:
+        while True:
+            if command_task.done():
+                command = command_task.result().strip()
+                if command == "quit" or not command:
+                    break
+                if command.startswith("restart"):
+                    await server.stop()
+                    await asyncio.sleep(0.4)
+                    fault = command.removeprefix("restart_") if command != "restart" else ""
+                    release.clear()
+                    missing = command in ("restart_missing", "restart_missing_reject_item_always")
+                    server, variables = await start_server(endpoint, missing)
+                    print("RESTARTED", flush=True)
+                elif command in ("cut", "cut_reject_activate", "cut_reject_activate_close", "cut_republish"):
+                    if command == "cut_reject_activate":
+                        fault = "reject_activate"
+                    if command == "cut_reject_activate_close":
+                        fault = "reject_activate_close"
+                    if command == "cut_republish":
+                        fault = "republish_notification"
+                    for protocol in list(server.bserver.clients):
+                        protocol.transport.close()
+                    print("CUT", flush=True)
+                elif command == "release":
+                    release.set()
+                    print("RELEASED", flush=True)
+                elif command in ("hold_publish", "hold_publish_error"):
+                    release.clear()
+                    fault = command
+                    print("ARMED", flush=True)
+                elif command == "clear_item_fault":
+                    fault = ""
+                    print("ITEM_FAULT_CLEARED", flush=True)
+                elif command == "stats":
+                    print(f"SESSIONS={len(server.iserver._external_sessions)}", flush=True)
+                elif command == "session_creations":
+                    print(f"SESSION_CREATES={session_creations}", flush=True)
+                elif command == "item_rejections":
+                    print(f"ITEM_REJECTIONS={item_rejections}", flush=True)
+                elif command == "subscriptions":
+                    print(f"SUBSCRIPTIONS={len(server.iserver.subscription_service.subscriptions)}", flush=True)
+                command_task = asyncio.create_task(asyncio.to_thread(sys.stdin.readline))
+            counter += 1
+            for variable in variables:
+                await variable.write_value(counter)
+            await asyncio.sleep(0.1)
+    finally:
+        release.set()
+        await server.stop()
+
+
+asyncio.run(main())
