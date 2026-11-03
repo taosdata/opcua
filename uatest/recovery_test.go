@@ -137,7 +137,7 @@ func recoveryValue(t *testing.T, ctx context.Context, notifications <-chan *opcu
 }
 
 func TestSubscriptionRecovery(t *testing.T) {
-	for _, fault := range []string{"restart", "cut", "cut_reject_activate", "cut_reject_activate_close", "restart_missing", "restart_reject_subscription", "restart_drop_subscription_response", "restart_drop_subscription_disconnect", "restart_reject_items", "restart_reject_item"} {
+	for _, fault := range []string{"restart", "cut", "cut_reject_activate", "cut_reject_activate_close", "restart_missing", "restart_reject_subscription", "restart_drop_subscription_response", "restart_drop_subscription_disconnect", "restart_reject_items", "restart_reject_item", "restart_reject_items_unexpected"} {
 		t.Run(fault, func(t *testing.T) {
 			ctx, client, server := startRecoveryClient(t)
 			notifications := make(chan *opcua.PublishNotificationData, 128)
@@ -168,6 +168,9 @@ func TestSubscriptionRecovery(t *testing.T) {
 					expectedSessions = round + 2
 				}
 				server.command(t, "stats", fmt.Sprintf("SESSIONS=%d", expectedSessions))
+				if fault == "restart_reject_items" || fault == "restart_reject_item" || fault == "restart_reject_items_unexpected" {
+					server.command(t, "session_creations", fmt.Sprintf("SESSION_CREATES=%d", round+2))
+				}
 				server.command(t, "subscriptions", "SUBSCRIPTIONS=1")
 			}
 		})

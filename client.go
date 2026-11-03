@@ -221,6 +221,10 @@ const (
 	abortReconnect        // the reconnecting is not possible
 )
 
+func canRetrySubscriptionInSession(err error) bool {
+	return errors.Is(err, ua.StatusBadTooManyOperations) || errors.Is(err, ua.StatusBadOutOfMemory)
+}
+
 // Connect establishes a secure channel and creates a new session.
 func (c *Client) Connect(ctx context.Context) error {
 	// todo(fs): the secure channel is 'nil' during a re-connect
@@ -575,14 +579,11 @@ func (c *Client) monitor(ctx context.Context) {
 							if err != nil {
 								dlog.Printf("recreate subscripitions failed: %v", err)
 								retry = append(retry, id)
-								var status ua.StatusCode
 								if errors.Is(err, errSubscriptionIDUnknown) {
 									discardSession = true
 									action = recreateSession
-								} else if errors.Is(err, ua.StatusBadSessionIDInvalid) || errors.Is(err, ua.StatusBadSessionClosed) {
+								} else if !canRetrySubscriptionInSession(err) {
 									action = recreateSession
-								} else if !errors.As(err, &status) || status == ua.StatusBadServerNotConnected || status == ua.StatusBadSecureChannelIDInvalid || status == ua.StatusBadTimeout {
-									action = createSecureChannel
 								}
 								continue
 							}

@@ -185,3 +185,22 @@ func TestCloneBrowseRequest(t *testing.T) {
 		})
 	}
 }
+
+func TestCanRetrySubscriptionInSession(t *testing.T) {
+	tests := []struct {
+		err  error
+		want bool
+	}{
+		{ua.StatusBadTooManyOperations, true},
+		{ua.StatusBadOutOfMemory, true},
+		{ua.StatusBadSessionNotActivated, false},
+		{ua.StatusBadSecureChannelClosed, false},
+		{ua.StatusBadSecureChannelTokenUnknown, false},
+		{ua.StatusBadUnexpectedError, false},
+	}
+	for _, tt := range tests {
+		if got := canRetrySubscriptionInSession(tt.err); got != tt.want {
+			t.Errorf("canRetrySubscriptionInSession(%v) = %t, want %t", tt.err, got, tt.want)
+		}
+	}
+}

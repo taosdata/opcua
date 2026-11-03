@@ -13,11 +13,13 @@ fault = ""
 release = asyncio.Event()
 original_subscription = InternalSession.create_subscription
 original_items = InternalSession.create_monitored_items
+original_create_session = InternalSession.create_session
 original_activate = InternalSession.activate_session
 original_close = InternalSession.close_session
 original_republish = InternalSubscription.republish
 original_publish_response = UaProcessor.forward_publish_response
 rejected_session = None
+session_creations = 0
 pending_publish = set()
 
 
@@ -74,6 +76,14 @@ async def close_session(session, *args, **kwargs):
     return await original_close(session, *args, **kwargs)
 
 
+async def create_session(session, *args, **kwargs):
+    global fault, session_creations
+    session_creations += 1
+    if fault == "reject_items_unexpected":
+        fault = ""
+    return await original_create_session(session, *args, **kwargs)
+
+
 async def create_subscription(session, *args, **kwargs):
     global fault
     if fault == "reject_subscription":
@@ -99,6 +109,8 @@ async def create_items(session, *args, **kwargs):
         if fault == "reject_items":
             fault = ""
         raise UaStatusCodeError(ua.StatusCodes.BadTooManyOperations)
+    if fault == "reject_items_unexpected":
+        raise UaStatusCodeError(ua.StatusCodes.BadUnexpectedError)
     if fault == "hold_items":
         fault = ""
         print("RESTORING", flush=True)
@@ -112,6 +124,7 @@ async def create_items(session, *args, **kwargs):
 
 InternalSession.create_subscription = create_subscription
 InternalSession.create_monitored_items = create_items
+InternalSession.create_session = create_session
 InternalSession.activate_session = activate_session
 InternalSession.close_session = close_session
 InternalSubscription.republish = republish
@@ -173,6 +186,8 @@ async def main():
                     print("ARMED", flush=True)
                 elif command == "stats":
                     print(f"SESSIONS={len(server.iserver._external_sessions)}", flush=True)
+                elif command == "session_creations":
+                    print(f"SESSION_CREATES={session_creations}", flush=True)
                 elif command == "subscriptions":
                     print(f"SUBSCRIPTIONS={len(server.iserver.subscription_service.subscriptions)}", flush=True)
                 command_task = asyncio.create_task(asyncio.to_thread(sys.stdin.readline))
