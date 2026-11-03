@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -37,6 +38,17 @@ func (server *recoveryServer) command(t *testing.T, command, expected string) {
 		t.Fatal(err)
 	}
 	server.expect(t, expected)
+}
+
+func (server *recoveryServer) query(t *testing.T, command string) string {
+	t.Helper()
+	if _, err := fmt.Fprintln(server.commands, command); err != nil {
+		t.Fatal(err)
+	}
+	if !server.output.Scan() {
+		t.Fatalf("server query %q: %v", command, server.output.Err())
+	}
+	return server.output.Text()
 }
 
 func startRecoveryClient(t *testing.T) (context.Context, *opcua.Client, *recoveryServer) {
@@ -260,6 +272,73 @@ func TestSubscriptionRecoveryPartialFailure(t *testing.T) {
 	server.command(t, "cut", "CUT")
 	recoveryValue(t, ctx, notifications, 1, time.Now())
 	server.command(t, "stats", "SESSIONS=1")
+}
+
+func TestSubscriptionRecoveryPermanentItemNotification(t *testing.T) {
+	ctx, client, server := startRecoveryClient(t)
+	notifications := make(chan *opcua.PublishNotificationData, 1)
+	subscription, err := client.Subscribe(ctx, &opcua.SubscriptionParameters{Interval: 100 * time.Millisecond}, notifications)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryMonitor(t, ctx, subscription, 1001, 1)
+	recoveryMonitor(t, ctx, subscription, 1002, 2)
+	recoveryValue(t, ctx, notifications, 1, time.Time{})
+	notifications <- &opcua.PublishNotificationData{}
+
+	baseline := runtime.NumGoroutine()
+	server.command(t, "restart_missing_reject_item_always", "RESTARTED")
+	deadline := time.Now().Add(8 * time.Second)
+	for {
+		var rejections int
+		if _, err := fmt.Sscanf(server.query(t, "item_rejections"), "ITEM_REJECTIONS=%d", &rejections); err != nil {
+			t.Fatal(err)
+		}
+		if rejections >= 12 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d failed restoration attempts", rejections)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if current := runtime.NumGoroutine(); current > baseline+8 {
+		t.Fatalf("blocked notifications accumulated goroutines: before=%d after=%d", baseline, current)
+	}
+
+	server.command(t, "clear_item_fault", "ITEM_FAULT_CLEARED")
+	<-notifications
+	var permanentErrors int
+	timeout := time.NewTimer(5 * time.Second)
+	for permanentErrors == 0 {
+		select {
+		case notification := <-notifications:
+			if notification.Error == ua.StatusBadNodeIDUnknown {
+				permanentErrors++
+			}
+		case <-timeout.C:
+			t.Fatal("missing permanent item error after successful recovery")
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	timeout.Stop()
+	recoveryValue(t, ctx, notifications, 1, time.Now())
+
+	quiet := time.NewTimer(500 * time.Millisecond)
+	for {
+		select {
+		case notification := <-notifications:
+			if notification.Error == ua.StatusBadNodeIDUnknown {
+				t.Fatal("permanent item error was notified more than once")
+			}
+		case <-quiet.C:
+			server.command(t, "stats", "SESSIONS=1")
+			return
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
 }
 
 func TestSubscriptionRecoveryBlockedNotifications(t *testing.T) {

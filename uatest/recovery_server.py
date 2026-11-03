@@ -20,6 +20,7 @@ original_republish = InternalSubscription.republish
 original_publish_response = UaProcessor.forward_publish_response
 rejected_session = None
 session_creations = 0
+item_rejections = 0
 pending_publish = set()
 
 
@@ -102,7 +103,7 @@ async def create_subscription(session, *args, **kwargs):
 
 
 async def create_items(session, *args, **kwargs):
-    global fault
+    global fault, item_rejections
     parameters = args[0]
     reject_persistently = fault == "reject_items_always" and any(item.ItemToMonitor.NodeId.Identifier == 1002 for item in parameters.ItemsToCreate)
     if fault == "reject_items" or reject_persistently:
@@ -119,6 +120,11 @@ async def create_items(session, *args, **kwargs):
     if fault == "reject_item":
         fault = ""
         result[0].StatusCode = ua.StatusCode(ua.StatusCodes.BadOutOfMemory)
+    if fault == "missing_reject_item_always":
+        item_rejections += 1
+        for item, item_result in zip(parameters.ItemsToCreate, result):
+            if item.ItemToMonitor.NodeId.Identifier != 1002:
+                item_result.StatusCode = ua.StatusCode(ua.StatusCodes.BadOutOfMemory)
     return result
 
 
@@ -165,7 +171,8 @@ async def main():
                     await asyncio.sleep(0.4)
                     fault = command.removeprefix("restart_") if command != "restart" else ""
                     release.clear()
-                    server, variables = await start_server(endpoint, command == "restart_missing")
+                    missing = command in ("restart_missing", "restart_missing_reject_item_always")
+                    server, variables = await start_server(endpoint, missing)
                     print("RESTARTED", flush=True)
                 elif command in ("cut", "cut_reject_activate", "cut_reject_activate_close", "cut_republish"):
                     if command == "cut_reject_activate":
@@ -184,10 +191,15 @@ async def main():
                     release.clear()
                     fault = command
                     print("ARMED", flush=True)
+                elif command == "clear_item_fault":
+                    fault = ""
+                    print("ITEM_FAULT_CLEARED", flush=True)
                 elif command == "stats":
                     print(f"SESSIONS={len(server.iserver._external_sessions)}", flush=True)
                 elif command == "session_creations":
                     print(f"SESSION_CREATES={session_creations}", flush=True)
+                elif command == "item_rejections":
+                    print(f"ITEM_REJECTIONS={item_rejections}", flush=True)
                 elif command == "subscriptions":
                     print(f"SUBSCRIPTIONS={len(server.iserver.subscription_service.subscriptions)}", flush=True)
                 command_task = asyncio.create_task(asyncio.to_thread(sys.stdin.readline))

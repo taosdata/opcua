@@ -320,6 +320,12 @@ func (s *Subscription) notify(ctx context.Context, data *PublishNotificationData
 	}
 }
 
+func (s *Subscription) notifyWithTimeout(ctx context.Context, data *PublishNotificationData) {
+	notifyCtx, cancel := context.WithTimeout(ctx, s.c.cfg.sechan.RequestTimeout)
+	defer cancel()
+	s.notify(notifyCtx, data)
+}
+
 // Stats returns a diagnostic struct with metadata about the current subscription
 func (s *Subscription) Stats(ctx context.Context) (*ua.SubscriptionDiagnosticsDataType, error) {
 	// TODO(kung-foo): once browsing feature is merged, attempt to get direct access to the
@@ -453,6 +459,7 @@ func (s *Subscription) recreate_NeedsSubMuxLock(ctx context.Context) error {
 	}
 	s.itemsMu.Unlock()
 	restored := make(map[uint32]*monitoredItem)
+	var permanentErrors []ua.StatusCode
 
 	for ts, items := range itemsByTimestamps {
 		req := &ua.CreateMonitoredItemsRequest{
@@ -479,7 +486,7 @@ func (s *Subscription) recreate_NeedsSubMuxLock(ctx context.Context) error {
 			switch result.StatusCode {
 			case ua.StatusOK:
 			case ua.StatusBadNodeIDUnknown, ua.StatusBadNodeIDInvalid, ua.StatusBadAttributeIDInvalid:
-				go s.notify(ctx, &PublishNotificationData{SubscriptionID: s.SubscriptionID, Error: result.StatusCode})
+				permanentErrors = append(permanentErrors, result.StatusCode)
 				continue
 			default:
 				return result.StatusCode
@@ -494,6 +501,9 @@ func (s *Subscription) recreate_NeedsSubMuxLock(ctx context.Context) error {
 	s.itemsMu.Lock()
 	s.items = restored
 	s.itemsMu.Unlock()
+	for _, status := range permanentErrors {
+		go s.notifyWithTimeout(ctx, &PublishNotificationData{SubscriptionID: s.SubscriptionID, Error: status})
+	}
 	dlog.Printf("subscription successfully recreated")
 
 	return nil
